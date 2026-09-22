@@ -246,7 +246,8 @@ describe("Auto Sync Settings & Tagging Logic", () => {
       const fakeAdmin = {
         graphql: async (query, { variables }) => {
           graphqlCalls.push({ query, variables });
-          if (query.includes("query getProductForImport")) {
+          // products/create and products/update share one read query.
+          if (query.includes("query getProductForTagSync")) {
             return {
               ok: true,
               json: async () => ({

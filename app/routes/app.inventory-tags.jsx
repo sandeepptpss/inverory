@@ -6,6 +6,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
   getSettings,
+  normalizeTagName,
   setSettings,
 } from "../services/inventory-tags.server";
 import {
@@ -15,15 +16,11 @@ import {
   tickBulkSync,
 } from "../services/bulk-sync.server";
 import {
-  bulkSyncElapsedLabel,
-  bulkSyncProgress,
-  bulkSyncProgressPercent,
-  bulkSyncStatusLabel,
+  bulkSyncPollDelayMs,
+  bulkSyncView,
   isBulkSyncActive,
   isBulkSyncFinished,
 } from "../lib/bulk-sync-status";
-
-const POLL_INTERVAL_MS = 2000;
 
 function ZapIcon({ size = 18, className = "" }) {
   return (
@@ -115,22 +112,40 @@ export const action = async ({ request }) => {
   const intent = formData.get("intent");
 
   if (intent === "save-settings") {
-    const tagName = String(formData.get("tagName") || "").trim();
-    const autoSyncRaw = formData.get("autoSyncEnabled");
-    const autoSyncEnabled = autoSyncRaw === "true" || autoSyncRaw === "on";
-
-    if (!tagName) {
-      return { intent, error: "Tag name cannot be empty." };
+    const validated = normalizeTagName(formData.get("tagName"));
+    if (!validated.ok) {
+      return { intent, error: validated.error };
     }
 
-    await setSettings(session.shop, { tagName, autoSyncEnabled });
-    return { intent, tagName, autoSyncEnabled };
+    try {
+      // Only the tag name: sending the toggle's client-side value along with it
+      // would silently revert a change made in another tab.
+      await setSettings(session.shop, { tagName: validated.tagName });
+      return { intent, tagName: validated.tagName };
+    } catch (error) {
+      console.error("Failed to save the tag name:", error);
+      return { intent, error: "Could not save the tag name. Please try again." };
+    }
   }
 
   if (intent === "toggle-auto-sync") {
     const autoSyncEnabled = formData.get("autoSyncEnabled") === "true";
-    await setSettings(session.shop, { autoSyncEnabled });
-    return { intent, autoSyncEnabled };
+    try {
+      await setSettings(session.shop, { autoSyncEnabled });
+      return { intent, autoSyncEnabled };
+    } catch (error) {
+      console.error("Failed to update Automatic Sync:", error);
+      // Hand back what is actually stored so the switch snaps back instead of
+      // sitting in a state the shop is not in.
+      const current = await getSettings(session.shop).catch(() => ({
+        autoSyncEnabled: !autoSyncEnabled,
+      }));
+      return {
+        intent,
+        error: "Could not update Automatic Sync. Please try again.",
+        autoSyncEnabled: current.autoSyncEnabled,
+      };
+    }
   }
 
   if (intent === "run-sync") {
@@ -180,6 +195,9 @@ export default function InventoryTagsPage() {
   const notifiedRef = useRef(null);
 
   const [tagName, setTagName] = useState(initialTagName);
+  // What is actually stored, so the field can warn that renaming the tag leaves
+  // the old one behind on every product that already carries it.
+  const [savedTagName, setSavedTagName] = useState(initialTagName);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(initialAutoSync);
 
   const isSaving = settingsFetcher.state !== "idle";
@@ -197,27 +215,34 @@ export default function InventoryTagsPage() {
   }, [syncFetcher.data, pollFetcher.data, cancelFetcher.data]);
 
   const pollRef = useRef(pollFetcher);
+  const jobRef = useRef(job);
   useEffect(() => {
     pollRef.current = pollFetcher;
+    jobRef.current = job;
   });
 
   useEffect(() => {
     if (!active) return undefined;
 
+    // Self-scheduling rather than a fixed interval, so the cadence can relax as
+    // a long run drags on. Reading the job from a ref keeps this effect tied to
+    // `active` alone — depending on `job` would restart the timer on every poll.
+    let timer;
     const poll = () => {
       if (pollRef.current.state === "idle") {
         pollRef.current.submit({ intent: "check-sync" }, { method: "POST" });
       }
+      timer = setTimeout(poll, bulkSyncPollDelayMs(jobRef.current));
     };
 
     poll();
-    const interval = setInterval(poll, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => clearTimeout(timer);
   }, [active]);
 
   useEffect(() => {
     if (settingsFetcher.data?.tagName !== undefined) {
       setTagName(settingsFetcher.data.tagName);
+      setSavedTagName(settingsFetcher.data.tagName);
     }
     if (settingsFetcher.data?.autoSyncEnabled !== undefined) {
       setAutoSyncEnabled(settingsFetcher.data.autoSyncEnabled);
@@ -274,22 +299,8 @@ export default function InventoryTagsPage() {
     );
   };
 
-  const percent = bulkSyncProgressPercent(job);
-  const progress = bulkSyncProgress(job);
-  const elapsed = bulkSyncElapsedLabel(job);
-  const statusText = startError
-    ? `Could not start the sync: ${startError}`
-    : isStarting && !active
-      ? "Starting sync…"
-      : bulkSyncStatusLabel(job);
-
-  const finished = isBulkSyncFinished(job);
-  const outcome =
-    startError || job?.status === "failed"
-      ? { tone: "critical", heading: "Sync unsuccessful" }
-      : job?.status === "cancelled"
-        ? { tone: "info", heading: "Sync cancelled" }
-        : { tone: "success", heading: "Sync complete" };
+  const view = bulkSyncView({ job, isStarting, startError });
+  const { percent, progress, elapsed, statusText, stats } = view;
 
   return (
     <s-page heading="Dashboard">
@@ -588,6 +599,21 @@ export default function InventoryTagsPage() {
           border: 1px solid #d2d5d8;
         }
 
+        .tag-rename-note {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          background: #fffbeb;
+          border: 1px solid #fde68a;
+          border-radius: 8px;
+          padding: 10px 14px;
+          margin-top: 8px;
+          font-size: 12.5px;
+          line-height: 1.5;
+          color: #78350f;
+        }
+
         .rules-wrapper {
           display: flex;
           flex-direction: column;
@@ -765,6 +791,32 @@ export default function InventoryTagsPage() {
           transition: width 0.3s ease;
         }
 
+        /* Shopify does not report a catalog size until the export finishes, so
+           there is no percentage to show yet. A sliding bar says "working" where
+           a bar frozen at 15% said "stuck". */
+        .progress-bar-fill.is-indeterminate {
+          width: 35%;
+          transition: none;
+          animation: indeterminate 1.4s ease-in-out infinite;
+        }
+
+        @keyframes indeterminate {
+          0% { margin-left: -35%; }
+          100% { margin-left: 100%; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .progress-bar-fill.is-indeterminate {
+            animation: none;
+            margin-left: 0;
+            width: 100%;
+            opacity: 0.45;
+          }
+          .status-dot {
+            animation: none;
+          }
+        }
+
         .progress-meta {
           display: flex;
           align-items: center;
@@ -848,6 +900,7 @@ export default function InventoryTagsPage() {
                   type="button"
                   role="switch"
                   aria-checked={autoSyncEnabled}
+                  aria-label="Automatic inventory sync"
                   onClick={() => handleToggleAutoSync(!autoSyncEnabled)}
                   className="switch-toggle-btn"
                   disabled={isSaving}
@@ -864,11 +917,6 @@ export default function InventoryTagsPage() {
             {/* Out-of-Stock Tag Configuration */}
             <settingsFetcher.Form method="post" className="tag-config-section">
               <input type="hidden" name="intent" value="save-settings" />
-              <input
-                type="hidden"
-                name="autoSyncEnabled"
-                value={autoSyncEnabled ? "true" : "false"}
-              />
 
               <label htmlFor="tagName" className="section-label">
                 Out-of-stock tag
@@ -904,6 +952,14 @@ export default function InventoryTagsPage() {
                   <TagIcon size={12} /> {tagName || "out-of-stock-hidden"}
                 </span>
               </div>
+
+              {tagName.trim() && tagName.trim() !== savedTagName && (
+                <div className="tag-rename-note">
+                  Renaming only changes what this app writes from now on. Products already
+                  carrying <code className="tag-chip">{savedTagName}</code> keep it — remove
+                  that tag in bulk from Shopify admin if you no longer want it.
+                </div>
+              )}
             </settingsFetcher.Form>
 
             {/* Rules Visual Grid */}
@@ -948,7 +1004,9 @@ export default function InventoryTagsPage() {
               <div className="rules-guardrail">
                 <span className="guardrail-icon"><ShieldCheckIcon size={18} /></span>
                 <span>
-                  <strong>Safety guardrail:</strong> Inactive products (Drafts & Archived) and untracked products are never modified.
+                  <strong>Safety guardrail:</strong> Draft and archived products are never
+                  modified. Products that don&rsquo;t track inventory are never tagged &mdash; and
+                  the tag is removed if they already carry it.
                 </span>
               </div>
             </div>
@@ -999,58 +1057,62 @@ export default function InventoryTagsPage() {
             </div>
 
             {/* Sync Progress or Outcome Box */}
-            {statusText && (
+            {view.mode !== "idle" && (
               <div className="progress-box">
-                {active ? (
+                {view.mode === "running" ? (
                   <>
                     <div className="progress-meta">
                       <strong style={{ color: "#202223" }}>{statusText}</strong>
                       <span>
-                        {percent !== null ? `${percent}%` : `${progress?.current ?? 0} products`}
+                        {percent !== null
+                          ? `${percent}%`
+                          : `${(progress?.current ?? 0).toLocaleString()} products`}
                         {elapsed ? ` · ${elapsed}` : ""}
                       </span>
                     </div>
 
-                    <div className="progress-bar-bg">
+                    <div
+                      className="progress-bar-bg"
+                      role="progressbar"
+                      aria-label="Catalog sync progress"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      {...(percent !== null ? { "aria-valuenow": percent } : {})}
+                    >
                       <div
-                        className="progress-bar-fill"
-                        style={{ width: `${percent ?? 15}%` }}
+                        className={`progress-bar-fill${percent === null ? " is-indeterminate" : ""}`}
+                        style={percent === null ? undefined : { width: `${percent}%` }}
                       />
                     </div>
                   </>
                 ) : (
                   <>
-                    <s-banner tone={outcome.tone} heading={outcome.heading}>
+                    <s-banner tone={view.tone} heading={view.heading}>
                       <s-paragraph>{statusText}</s-paragraph>
-                      {elapsed && !startError && (
+                      {elapsed && (
                         <s-paragraph color="subdued">Took {elapsed}.</s-paragraph>
                       )}
                     </s-banner>
 
-                    {finished && job?.status === "completed" && (
+                    {stats.length > 0 && (
                       <div className="sync-stats-bar">
-                        <div className="stat-item">
-                          <span className="stat-label">Scanned</span>
-                          <span className="stat-value">{job?.total || job?.exported || 0}</span>
-                        </div>
-                        <div className="stat-item">
-                          <span className="stat-label">Tagged</span>
-                          <span className="stat-value" style={{ color: "#b91c1c" }}>
-                            {job?.tagged || 0}
-                          </span>
-                        </div>
-                        <div className="stat-item">
-                          <span className="stat-label">Untagged</span>
-                          <span className="stat-value" style={{ color: "#15803d" }}>
-                            {job?.untagged || 0}
-                          </span>
-                        </div>
-                        {elapsed && (
-                          <div className="stat-item">
-                            <span className="stat-label">Duration</span>
-                            <span className="stat-value">{elapsed}</span>
+                        {stats.map((stat) => (
+                          <div className="stat-item" key={stat.label}>
+                            <span className="stat-label">{stat.label}</span>
+                            <span
+                              className="stat-value"
+                              style={
+                                stat.tone === "critical"
+                                  ? { color: "#b91c1c" }
+                                  : stat.tone === "success"
+                                    ? { color: "#15803d" }
+                                    : undefined
+                              }
+                            >
+                              {stat.value}
+                            </span>
                           </div>
-                        )}
+                        ))}
                       </div>
                     )}
                   </>

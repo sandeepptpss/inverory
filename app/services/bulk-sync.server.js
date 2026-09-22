@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import db from "../db.server";
 import { unauthenticated } from "../shopify.server";
-import { resolveTagAction } from "./inventory-tags.server";
+import { resolveTagAction, tagForAction } from "./inventory-tags.server";
 import { ACTIVE_STATUSES, isBulkSyncActive, SYNC_STATUS } from "../lib/bulk-sync-status";
 import {
   FatalError,
@@ -702,7 +702,12 @@ async function stepDownloading(admin, job) {
       if (action === "add") {
         await addWriter.write({ id: product.id, tags: [job.tagName] });
       } else if (action === "remove") {
-        await removeWriter.write({ id: product.id, tags: [job.tagName] });
+        // The casing stored on the product, so the removal lands whether or not
+        // Shopify matches tag case.
+        await removeWriter.write({
+          id: product.id,
+          tags: [tagForAction(product.tags, job.tagName, "remove")],
+        });
       }
 
       // Checkpoint: publishes "Scanning 5,000 of 150,000" to the UI and renews

@@ -3,6 +3,41 @@ import { graphqlWithRetry } from "./shopify-retry.server";
 
 export const DEFAULT_TAG_NAME = "out-of-stock-hidden";
 export const DEFAULT_AUTO_SYNC = false;
+/** Shopify rejects a tag longer than this. */
+export const MAX_TAG_LENGTH = 255;
+
+/**
+ * Validates and cleans a merchant-entered tag name.
+ *
+ * A comma is the killer: Shopify splits `tagsAdd(tags: ["a, b"])` into two
+ * separate tags, so the configured name could never be found on the product
+ * again — every sync would re-tag the whole catalog and no product would ever
+ * be untagged.
+ */
+export function normalizeTagName(value) {
+  const tagName = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!tagName) {
+    return { ok: false, error: "Tag name cannot be empty." };
+  }
+  if (tagName.includes(",")) {
+    return {
+      ok: false,
+      error:
+        "Tag name cannot contain a comma — Shopify reads it as a separator between two tags.",
+    };
+  }
+  if (tagName.length > MAX_TAG_LENGTH) {
+    return {
+      ok: false,
+      error: `Tag name cannot be longer than ${MAX_TAG_LENGTH} characters.`,
+    };
+  }
+
+  return { ok: true, tagName };
+}
 
 export async function getSettings(shop) {
   const setting = await db.tagAutomationSetting.findUnique({ where: { shop } });
@@ -18,6 +53,12 @@ export async function getTagName(shop) {
 }
 
 export async function setSettings(shop, { tagName, autoSyncEnabled }) {
+  if (tagName !== undefined) {
+    const validated = normalizeTagName(tagName);
+    if (!validated.ok) throw new Error(validated.error);
+    tagName = validated.tagName;
+  }
+
   const existing = await db.tagAutomationSetting.findUnique({
     where: { shop },
   });
@@ -46,14 +87,58 @@ export async function setTagName(shop, tagName) {
   return setSettings(shop, { tagName });
 }
 
+const canonicalTag = (value) => String(value ?? "").trim().toLowerCase();
+
+/**
+ * The tag as it is actually stored on the product, or null. Shopify treats tags
+ * case-insensitively, so "Out-Of-Stock" and "out-of-stock" are one tag to the
+ * store — matching on the exact string left a restocked product tagged forever
+ * and re-sent tagsAdd for it on every run.
+ */
+export function findExistingTag(tags, tagName) {
+  const wanted = canonicalTag(tagName);
+  if (!wanted) return null;
+  const tagList = Array.isArray(tags) ? tags : [];
+  return tagList.find((tag) => canonicalTag(tag) === wanted) ?? null;
+}
+
+/**
+ * The exact string to hand Shopify for this action. A removal targets the
+ * casing stored on the product, so it works whether or not Shopify matches tag
+ * case on the way out.
+ */
+export function tagForAction(tags, tagName, action) {
+  if (action !== "remove") return tagName;
+  return findExistingTag(tags, tagName) ?? tagName;
+}
+
+/**
+ * A quantity only counts when Shopify really reported a number. Passing the
+ * value straight to `< 1` reads `""`, `[]` and `null` as "out of stock" and
+ * tags a product that is actually in stock.
+ */
+function toQuantity(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 // Pure decision logic, kept separate from I/O so it can be unit tested directly.
 export function resolveTagAction({ status, tags, quantity, tracked, tagName }) {
   if (status !== "ACTIVE") {
     return null;
   }
 
-  const tagList = Array.isArray(tags) ? tags : [];
-  const hasTag = tagList.includes(tagName);
+  // Without a configured tag there is no decision to make; acting would mean
+  // writing an empty tag onto the catalog.
+  if (!canonicalTag(tagName)) {
+    return null;
+  }
+
+  const hasTag = findExistingTag(tags, tagName) !== null;
 
   // Untracked products stay purchasable no matter what quantity reports, so they
   // must never carry the tag.
@@ -61,14 +146,12 @@ export function resolveTagAction({ status, tags, quantity, tracked, tagName }) {
     return hasTag ? "remove" : null;
   }
 
-  // A tracked product must report a real number before any tag decision is made.
-  // `null < 1` is true in JS, so a missing/garbled quantity used to be read as
-  // "out of stock" and tagged an in-stock product.
-  if (!Number.isFinite(Number(quantity)) || quantity === null) {
+  const amount = toQuantity(quantity);
+  if (amount === null) {
     return null;
   }
 
-  if (quantity < 1) {
+  if (amount < 1) {
     return hasTag ? null : "add";
   }
 

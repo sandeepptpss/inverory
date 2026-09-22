@@ -52,6 +52,13 @@ api_version = "2026-10"
   uri = "/webhooks/products/create"
   topics = [ "products/create" ]
 
+  # Publishing a sold-out draft, archiving a product, or toggling inventory
+  # tracking changes nothing about inventory levels, so only this topic tells us
+  # the product's eligibility for the rules has changed.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/update"
+  topics = [ "products/update" ]
+
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
 

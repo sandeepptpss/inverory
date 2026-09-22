@@ -68,8 +68,12 @@ export class ShopifySimulator {
     this.hangQuery = options.hangQuery ?? false;
     // Keep the query operation in CREATED (queued at Shopify, never started).
     this.queueQueryForever = options.queueQueryForever ?? false;
-    // Which synthetic catalog the export serves.
-    this.catalog = CATALOGS[options.catalog ?? "mixed"] ?? CATALOGS.mixed;
+    // Which synthetic catalog the export serves: a name from CATALOGS, or a
+    // bespoke `(index) => product` builder supplied by the test.
+    this.catalog =
+      typeof options.catalog === "function"
+        ? options.catalog
+        : (CATALOGS[options.catalog ?? "mixed"] ?? CATALOGS.mixed);
 
     this.calls = [];
     this.operations = new Map();

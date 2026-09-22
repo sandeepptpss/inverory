@@ -108,6 +108,109 @@ export function bulkSyncStatusLabel(job) {
   }
 }
 
+/**
+ * Everything the dashboard needs to render the sync panel, derived in one place
+ * so the headline, the banner tone and the stat tiles cannot disagree.
+ *
+ * `isStarting` deliberately outranks a finished job: the component still holds
+ * the previous run while the new one is being claimed, and rendering that as an
+ * outcome showed "Sync complete" — with the old counts — over a run that had
+ * just been kicked off.
+ */
+export function bulkSyncView({ job = null, isStarting = false, startError = null } = {}) {
+  const base = {
+    mode: "idle",
+    statusText: null,
+    percent: null,
+    progress: null,
+    elapsed: null,
+    tone: null,
+    heading: null,
+    stats: [],
+  };
+
+  if (isBulkSyncActive(job)) {
+    return {
+      ...base,
+      mode: "running",
+      statusText: bulkSyncStatusLabel(job),
+      percent: bulkSyncProgressPercent(job),
+      progress: bulkSyncProgress(job),
+      elapsed: bulkSyncElapsedLabel(job),
+    };
+  }
+
+  if (isStarting) {
+    return { ...base, mode: "running", statusText: "Starting sync…" };
+  }
+
+  if (startError) {
+    return {
+      ...base,
+      mode: "finished",
+      statusText: `Could not start the sync: ${startError}`,
+      tone: "critical",
+      heading: "Sync unsuccessful",
+    };
+  }
+
+  if (!isBulkSyncFinished(job)) return base;
+
+  const finished = {
+    ...base,
+    mode: "finished",
+    statusText: bulkSyncStatusLabel(job),
+    elapsed: bulkSyncElapsedLabel(job),
+  };
+
+  if (job.status === SYNC_STATUS.failed) {
+    return { ...finished, tone: "critical", heading: "Sync unsuccessful" };
+  }
+  if (job.status === SYNC_STATUS.cancelled) {
+    // A cancelled run stopped part-way, so its counters describe nothing a
+    // merchant can act on.
+    return { ...finished, tone: "info", heading: "Sync cancelled" };
+  }
+
+  // `processed` is what the sync actually classified; `total` is Shopify's
+  // export size, which counts any non-product row too. Reporting `total` here
+  // made the tile disagree with the sentence right above it.
+  const stats = [
+    { label: "Scanned", value: count(job.processed) },
+    { label: "Tagged", value: count(job.tagged), tone: "critical" },
+    { label: "Untagged", value: count(job.untagged), tone: "success" },
+  ];
+  if (Number(job.failed) > 0) {
+    stats.push({ label: "Failed", value: count(job.failed), tone: "critical" });
+  }
+  if (finished.elapsed) {
+    stats.push({ label: "Duration", value: finished.elapsed });
+  }
+
+  return { ...finished, tone: "success", heading: "Sync complete", stats };
+}
+
+/** Dashboard poll cadence, in ms, for a run that has been going this long. */
+export const POLL_FAST_MS = 2_000;
+export const POLL_MEDIUM_MS = 5_000;
+export const POLL_SLOW_MS = 10_000;
+
+/**
+ * A full catalog sync is usually over in minutes, so the first stretch polls
+ * fast enough to feel live. Past that the run is a long export sitting in
+ * Shopify's queue and a fixed 2s poll is just load: a six-hour job would make
+ * ~10,800 round trips per open tab.
+ */
+export function bulkSyncPollDelayMs(job, now = Date.now()) {
+  const startedAt = job?.startedAt ? new Date(job.startedAt).getTime() : NaN;
+  if (!Number.isFinite(startedAt)) return POLL_FAST_MS;
+
+  const runningMs = now - startedAt;
+  if (runningMs < 2 * 60_000) return POLL_FAST_MS;
+  if (runningMs < 10 * 60_000) return POLL_MEDIUM_MS;
+  return POLL_SLOW_MS;
+}
+
 export function bulkSyncElapsedLabel(job) {
   if (!job?.startedAt) return null;
 

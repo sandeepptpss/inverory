@@ -3,6 +3,7 @@ import {
   applyTagAction,
   getSettings,
   resolveTagAction,
+  tagForAction,
   withProductLock,
 } from "../services/inventory-tags.server";
 import {
@@ -103,7 +104,9 @@ export const action = async ({ request }) => {
       const userErrors = await applyTagAction(
         admin,
         product.id,
-        tagName,
+        // A removal targets the casing stored on the product, not the
+        // configured one, so it lands whether or not Shopify matches tag case.
+        tagForAction(product.tags, tagName, tagAction),
         tagAction,
         {
           attempts: WEBHOOK_ATTEMPTS,
