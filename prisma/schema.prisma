@@ -1,0 +1,83 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model TagAutomationSetting {
+  shop            String  @id
+  tagName         String  @default("out-of-stock-hidden")
+  autoSyncEnabled Boolean @default(false)
+}
+
+model BulkSyncJob {
+  shop                          String  @id
+  tagName                       String
+  // querying | downloading | tagging | untagging | completed | failed | cancelled
+  status                        String
+  queryBulkOperationId          String?
+  addMutationBulkOperationId    String?
+  removeMutationBulkOperationId String?
+  addJsonlPath                  String? @db.Text
+  removeJsonlPath               String? @db.Text
+
+  // Progress counters. `total` is only known once the export finishes, because
+  // Shopify does not report a catalog size up front.
+  exported          Int @default(0)
+  total             Int @default(0)
+  processed         Int @default(0)
+  mutationProcessed Int @default(0)
+  toTag             Int @default(0)
+  toUntag           Int @default(0)
+  tagged            Int @default(0)
+  untagged          Int @default(0)
+  failed            Int @default(0)
+
+  errorMessage String? @db.Text
+
+  // Lease: whichever process holds an unexpired lease owns the job. Prevents two
+  // instances (or a restart racing its own old runner) from downloading the same
+  // export twice or starting duplicate bulk mutations.
+  lockedBy    String?
+  lockedUntil DateTime?
+
+  // Watchdog: a job that stops moving is failed rather than left hanging.
+  attempts          Int       @default(0)
+  lastProgressAt    DateTime?
+  lastProgressCount Int       @default(0)
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  updatedAt  DateTime  @updatedAt
+
+  @@index([status])
+}
