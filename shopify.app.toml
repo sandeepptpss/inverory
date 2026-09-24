@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "4c533d300634b9dbcd682fe2668dac78"
-application_url = "https://example.com"
+client_id = "cc6b49de840467d9b426a2650303cbf4"
+application_url = "https://weeks-gardening-biological-synthesis.trycloudflare.com"
 embedded = true
 name = "Inventory"
 
@@ -60,7 +60,7 @@ api_version = "2026-10"
   topics = [ "products/update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://weeks-gardening-biological-synthesis.trycloudflare.com/api/auth" ]
 
 [build]
 automatically_update_urls_on_dev = true

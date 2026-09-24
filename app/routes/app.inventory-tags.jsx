@@ -65,6 +65,14 @@ function TagIcon({ size = 15, className = "" }) {
   );
 }
 
+function SearchIcon({ size = 15, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" className={className} aria-hidden="true">
+      <path fillRule="evenodd" d="M9 3.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM2 9a7 7 0 1 1 12.452 4.391l3.328 3.329a.75.75 0 1 1-1.06 1.06l-3.329-3.328A7 7 0 0 1 2 9z" clipRule="evenodd" />
+    </svg>
+  );
+}
+
 function MinusCircleIcon({ size = 16, className = "" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" className={className} aria-hidden="true">
@@ -318,15 +326,26 @@ export default function InventoryTagsPage() {
     initialCollectionTitle || "",
   );
 
-  // A collection saved earlier may not be in the loaded page of collections (a
-  // very long list, or a list that failed to load). Keeping it as an option
-  // means opening the dropdown cannot silently reset the scope to "all".
+  const [extraCollection, setExtraCollection] = useState(null);
+
+  // A collection saved earlier or picked via the resource picker may not be in
+  // the initial loaded batch of collections (e.g. for catalogs with 5,000+ collections).
+  // Keeping it ensures it always appears in the dropdown as selectable and visible.
   const collectionOptions = (() => {
-    const options = collections ?? [];
-    if (!savedCollectionId || options.some((c) => c.id === savedCollectionId)) {
-      return options;
+    const options = [...(collections ?? [])];
+    const ensureOption = (opt) => {
+      if (opt && opt.id && !options.some((c) => c.id === opt.id)) {
+        options.unshift(opt);
+      }
+    };
+    if (extraCollection) ensureOption(extraCollection);
+    if (savedCollectionId) {
+      ensureOption({ id: savedCollectionId, title: savedCollectionTitle || savedCollectionId });
     }
-    return [{ id: savedCollectionId, title: savedCollectionTitle || savedCollectionId }, ...options];
+    if (collectionId) {
+      ensureOption({ id: collectionId, title: collectionTitle || collectionId });
+    }
+    return options;
   })();
 
   const handleCollectionChange = (nextId) => {
@@ -334,6 +353,28 @@ export default function InventoryTagsPage() {
     setCollectionTitle(
       collectionOptions.find((c) => c.id === nextId)?.title ?? "",
     );
+  };
+
+  const handleBrowseCollections = async () => {
+    try {
+      if (!shopify?.resourcePicker) {
+        console.warn("Shopify resourcePicker is not available in this environment.");
+        return;
+      }
+      const selected = await shopify.resourcePicker({
+        type: "collection",
+        multiple: false,
+        selectionIds: collectionId ? [{ id: collectionId }] : [],
+      });
+      if (selected && selected.length > 0) {
+        const picked = selected[0];
+        setExtraCollection({ id: picked.id, title: picked.title || picked.id });
+        setCollectionId(picked.id);
+        setCollectionTitle(picked.title || "");
+      }
+    } catch (err) {
+      console.error("Resource picker error:", err);
+    }
   };
 
   const scopeDirty =
@@ -771,6 +812,62 @@ export default function InventoryTagsPage() {
         .save-btn:disabled {
           background: #8c9196;
           cursor: not-allowed;
+        }
+
+        .scope-control-row {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+
+        .scope-picker-btn {
+          height: 38px;
+          padding: 0 14px;
+          background: #ffffff;
+          color: #202223;
+          border: 1.5px solid #babfc3;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          white-space: nowrap;
+          box-shadow: 0 1px 0 rgba(0, 0, 0, 0.05);
+          transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .scope-picker-btn:hover {
+          background: #f6f6f7;
+          border-color: #8c9196;
+        }
+        .scope-picker-btn:focus {
+          outline: none;
+          border-color: #008060;
+          box-shadow: 0 0 0 3px rgba(0, 128, 96, 0.2);
+        }
+
+        .scope-clear-btn {
+          height: 38px;
+          padding: 0 12px;
+          background: #ffffff;
+          color: #6d7175;
+          border: 1px dashed #babfc3;
+          border-radius: 8px;
+          font-size: 12.5px;
+          font-weight: 500;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          white-space: nowrap;
+          transition: all 0.15s ease;
+        }
+        .scope-clear-btn:hover {
+          background: #fef2f2;
+          color: #b91c1c;
+          border-color: #fca5a5;
         }
 
         .scope-select {
@@ -1229,24 +1326,50 @@ export default function InventoryTagsPage() {
                 Sync scope
               </label>
 
-              <select
-                id="collectionId"
-                name="collectionId"
-                className="scope-select"
-                value={collectionId}
-                onChange={(e) => handleCollectionChange(e.target.value)}
-                disabled={collectionsUnavailable && !savedCollectionId}
-              >
-                <option value="">Entire product catalog (all products)</option>
-                {collectionOptions.map((collection) => (
-                  <option key={collection.id} value={collection.id}>
-                    {collection.title}
-                    {collectionMissing && collection.id === savedCollectionId
-                      ? " (no longer exists)"
-                      : ""}
-                  </option>
-                ))}
-              </select>
+              <div className="scope-control-row">
+                <select
+                  id="collectionId"
+                  name="collectionId"
+                  className="scope-select"
+                  value={collectionId}
+                  onChange={(e) => handleCollectionChange(e.target.value)}
+                  disabled={collectionsUnavailable && !savedCollectionId}
+                >
+                  <option value="">Entire product catalog (all products)</option>
+                  {collectionOptions.map((collection) => (
+                    <option key={collection.id} value={collection.id}>
+                      {collection.title}
+                      {collectionMissing && collection.id === savedCollectionId
+                        ? " (no longer exists)"
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+
+                <button
+                  type="button"
+                  className="scope-picker-btn"
+                  onClick={handleBrowseCollections}
+                  title="Search and select from all 5,000+ collections in your store"
+                >
+                  <SearchIcon size={14} />
+                  <span>Browse all collections</span>
+                </button>
+
+                {collectionId ? (
+                  <button
+                    type="button"
+                    className="scope-clear-btn"
+                    onClick={() => {
+                      setCollectionId("");
+                      setCollectionTitle("");
+                    }}
+                    title="Switch back to entire product catalog"
+                  >
+                    Reset to all products
+                  </button>
+                ) : null}
+              </div>
               {/* Titles are not resolvable from the id alone on the server, so
                   the label the merchant picked travels with the selection. */}
               <input
