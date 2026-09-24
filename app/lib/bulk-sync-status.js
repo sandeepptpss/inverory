@@ -39,6 +39,24 @@ function count(value) {
 }
 
 /**
+ * " in “Summer Sale”" for a collection-scoped run, and the empty string for a
+ * whole-catalog one — so every existing message is byte-for-byte what it was
+ * before collection scoping existed.
+ */
+function scopeSuffix(job) {
+  if (!job?.collectionId) return "";
+  return job.collectionTitle
+    ? ` in “${job.collectionTitle}”`
+    : " in the selected collection";
+}
+
+/** Human label for the scope a job (or the settings) is pointed at. */
+export function syncScopeLabel({ collectionId = null, collectionTitle = null } = {}) {
+  if (!collectionId) return "Entire product catalog";
+  return collectionTitle ? `Collection: ${collectionTitle}` : "Selected collection";
+}
+
+/**
  * Determinate progress for the current phase, or null when the phase has no
  * known denominator yet (Shopify does not tell us the catalog size until the
  * export finishes, so the query phase counts up instead of filling a bar).
@@ -83,8 +101,8 @@ export function bulkSyncStatusLabel(job) {
 
     case SYNC_STATUS.downloading:
       return job.total > 0
-        ? `Scanning ${count(job.processed)} of ${count(job.total)} products…`
-        : `Scanning ${count(job.processed)} products…`;
+        ? `Scanning ${count(job.processed)} of ${count(job.total)} products${scopeSuffix(job)}…`
+        : `Scanning ${count(job.processed)} products${scopeSuffix(job)}…`;
 
     case SYNC_STATUS.tagging:
       return `Applying the tag — ${count(job.mutationProcessed)} of ${count(job.toTag)} products…`;
@@ -94,7 +112,7 @@ export function bulkSyncStatusLabel(job) {
 
     case SYNC_STATUS.completed: {
       const failed = job.failed > 0 ? `, ${count(job.failed)} failed` : "";
-      return `Sync complete — scanned ${count(job.processed)} products, tagged ${count(job.tagged)}, untagged ${count(job.untagged)}${failed}.`;
+      return `Sync complete — scanned ${count(job.processed)} products${scopeSuffix(job)}, tagged ${count(job.tagged)}, untagged ${count(job.untagged)}${failed}.`;
     }
 
     case SYNC_STATUS.failed:
@@ -176,9 +194,23 @@ export function bulkSyncView({ job = null, isStarting = false, startError = null
   // export size, which counts any non-product row too. Reporting `total` here
   // made the tile disagree with the sentence right above it.
   const stats = [
+    // Only when the run was scoped: on a whole-catalog sync the tile would be
+    // noise, and the tile row is what a merchant reads to confirm a run did
+    // what they expected.
+    ...(job.collectionId
+      ? [{ label: "Scope", value: job.collectionTitle || "Selected collection" }]
+      : []),
     { label: "Scanned", value: count(job.processed) },
-    { label: "Tagged", value: count(job.tagged), tone: "critical" },
-    { label: "Untagged", value: count(job.untagged), tone: "success" },
+    {
+      label: "Tags Added",
+      value: count(job.tagged),
+      tone: Number(job.tagged) > 0 ? "critical" : undefined,
+    },
+    {
+      label: "Tags Removed",
+      value: count(job.untagged),
+      tone: Number(job.untagged) > 0 ? "success" : undefined,
+    },
   ];
   if (Number(job.failed) > 0) {
     stats.push({ label: "Failed", value: count(job.failed), tone: "critical" });

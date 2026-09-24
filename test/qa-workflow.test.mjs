@@ -218,10 +218,20 @@ describe("tag settings", () => {
     await tags.setSettings(shop, { tagName: "sold-out", autoSyncEnabled: true });
 
     await tags.setSettings(shop, { autoSyncEnabled: false });
-    assert.deepEqual(await tags.getSettings(shop), { tagName: "sold-out", autoSyncEnabled: false });
+    assert.deepEqual(await tags.getSettings(shop), {
+      tagName: "sold-out",
+      autoSyncEnabled: false,
+      collectionId: null,
+      collectionTitle: null,
+    });
 
     await tags.setSettings(shop, { tagName: "backorder" });
-    assert.deepEqual(await tags.getSettings(shop), { tagName: "backorder", autoSyncEnabled: false });
+    assert.deepEqual(await tags.getSettings(shop), {
+      tagName: "backorder",
+      autoSyncEnabled: false,
+      collectionId: null,
+      collectionTitle: null,
+    });
   });
 
   it("keeps each shop's settings separate", async () => {
@@ -231,8 +241,18 @@ describe("tag settings", () => {
     await tags.setSettings(a, { tagName: "a-tag", autoSyncEnabled: true });
     await tags.setSettings(b, { tagName: "b-tag", autoSyncEnabled: false });
 
-    assert.deepEqual(await tags.getSettings(a), { tagName: "a-tag", autoSyncEnabled: true });
-    assert.deepEqual(await tags.getSettings(b), { tagName: "b-tag", autoSyncEnabled: false });
+    assert.deepEqual(await tags.getSettings(a), {
+      tagName: "a-tag",
+      autoSyncEnabled: true,
+      collectionId: null,
+      collectionTitle: null,
+    });
+    assert.deepEqual(await tags.getSettings(b), {
+      tagName: "b-tag",
+      autoSyncEnabled: false,
+      collectionId: null,
+      collectionTitle: null,
+    });
   });
 
   describe("validation", () => {

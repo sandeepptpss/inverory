@@ -26,6 +26,24 @@ const PRODUCT_FOR_INVENTORY_ITEM = `#graphql
     }
   }`;
 
+// Separate document rather than a conditional field, so the unscoped path sends
+// exactly the query it always sent and costs exactly what it always cost.
+const PRODUCT_FOR_INVENTORY_ITEM_IN_COLLECTION = `#graphql
+  query getProductForInventoryItemInCollection($id: ID!, $collectionId: ID!) {
+    inventoryItem(id: $id) {
+      variant {
+        product {
+          id
+          status
+          tags
+          totalInventory
+          tracksInventory
+          inCollection(id: $collectionId)
+        }
+      }
+    }
+  }`;
+
 // Shopify treats a webhook that does not answer within a few seconds as a failed
 // delivery, so the in-request retry budget is deliberately small: one quick
 // retry absorbs a momentary throttle, and anything worse is handed back as a
@@ -55,6 +73,19 @@ export const action = async ({ request }) => {
   }
 
   const inventoryItemGid = `gid://shopify/InventoryItem/${inventoryItemId}`;
+  const collectionId = settings.collectionId ?? null;
+  const lookupQuery = collectionId
+    ? PRODUCT_FOR_INVENTORY_ITEM_IN_COLLECTION
+    : PRODUCT_FOR_INVENTORY_ITEM;
+  const lookupOptions = {
+    variables: collectionId
+      ? { id: inventoryItemGid, collectionId }
+      : { id: inventoryItemGid },
+    label: collectionId
+      ? "getProductForInventoryItemInCollection"
+      : "getProductForInventoryItem",
+    attempts: WEBHOOK_ATTEMPTS,
+  };
 
   try {
     // Resolve the product first so the lock can be keyed on it. Shopify fires one
@@ -62,11 +93,7 @@ export const action = async ({ request }) => {
     // product delivers several concurrently; without the lock they each read
     // totalInventory from a different moment and can apply their tag mutations out
     // of order, leaving the tag contradicting actual stock.
-    const lookup = await graphqlWithRetry(admin, PRODUCT_FOR_INVENTORY_ITEM, {
-      variables: { id: inventoryItemGid },
-      label: "getProductForInventoryItem",
-      attempts: WEBHOOK_ATTEMPTS,
-    });
+    const lookup = await graphqlWithRetry(admin, lookupQuery, lookupOptions);
 
     const productId = lookup?.inventoryItem?.variant?.product?.id;
     if (!productId) {
@@ -79,13 +106,8 @@ export const action = async ({ request }) => {
       // before the wait would undo its work. Uncontended webhooks — the normal
       // case — reuse the lookup and cost no extra call.
       const product = waited
-        ? (
-            await graphqlWithRetry(admin, PRODUCT_FOR_INVENTORY_ITEM, {
-              variables: { id: inventoryItemGid },
-              label: "getProductForInventoryItem",
-              attempts: WEBHOOK_ATTEMPTS,
-            })
-          )?.inventoryItem?.variant?.product
+        ? (await graphqlWithRetry(admin, lookupQuery, lookupOptions))
+            ?.inventoryItem?.variant?.product
         : lookup.inventoryItem.variant.product;
 
       if (!product) return;
@@ -97,6 +119,8 @@ export const action = async ({ request }) => {
         quantity: product.totalInventory,
         tracked: product.tracksInventory,
         tagName,
+        collectionScoped: Boolean(collectionId),
+        inCollection: product.inCollection,
       });
 
       if (!tagAction) return;

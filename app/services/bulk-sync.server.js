@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import db from "../db.server";
 import { unauthenticated } from "../shopify.server";
-import { resolveTagAction, tagForAction } from "./inventory-tags.server";
+import {
+  collectionLegacyId,
+  resolveTagAction,
+  tagForAction,
+} from "./inventory-tags.server";
 import { ACTIVE_STATUSES, isBulkSyncActive, SYNC_STATUS } from "../lib/bulk-sync-status";
 import {
   FatalError,
@@ -40,10 +44,24 @@ const PROGRESS_BATCH_SIZE = num(process.env.BULK_SYNC_PROGRESS_BATCH, 2_000);
 
 const INSTANCE_ID = `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
 
-// Only top-level product fields, so every export line is one product and the
-// JSONL stays small: ~150 bytes per product, ~22MB for a 150k catalog.
-const PRODUCTS_BULK_QUERY = `{
-  products(query: "status:active") {
+/**
+ * Only top-level product fields, so every export line is one product and the
+ * JSONL stays small: ~150 bytes per product, ~22MB for a 150k catalog.
+ *
+ * A collection scope is applied as a search filter on the same root connection
+ * rather than by nesting the export under `collection(id:)`. That keeps the
+ * export one product per line — the shape the whole streaming/classify/mutate
+ * pipeline is built on — and it keeps Shopify, not this app, responsible for
+ * resolving membership (including smart collections).
+ */
+export function productsBulkQuery(collectionId) {
+  const legacyId = collectionLegacyId(collectionId);
+  const filter = legacyId
+    ? `status:active AND collection_id:${legacyId}`
+    : "status:active";
+
+  return `{
+  products(query: ${JSON.stringify(filter)}) {
     edges {
       node {
         id
@@ -55,6 +73,7 @@ const PRODUCTS_BULK_QUERY = `{
     }
   }
 }`;
+}
 
 const ADD_TAG_MUTATION = `mutation call($id: ID!, $tags: [String!]!) {
   tagsAdd(id: $id, tags: $tags) {
@@ -90,10 +109,12 @@ export async function getBulkSyncJob(shop) {
  * launch a bulk query; the conditional write means exactly one wins.
  * Returns null when someone else already holds the run.
  */
-async function claimStart(shop, tagName) {
+async function claimStart(shop, tagName, scope) {
   const now = new Date();
   const claim = {
     tagName,
+    collectionId: scope.collectionId,
+    collectionTitle: scope.collectionTitle,
     status: SYNC_STATUS.querying,
     queryBulkOperationId: null,
     addMutationBulkOperationId: null,
@@ -140,7 +161,15 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
     await cleanupFiles(previous);
   }
 
-  const claimed = await claimStart(shop, tagName);
+  // The scope is pinned onto the job at claim time, so a merchant who changes
+  // the selection while a run is in flight does not retarget a job that has
+  // already asked Shopify for a particular export.
+  const scope = {
+    collectionId: options.collectionId ?? null,
+    collectionTitle: (options.collectionId && options.collectionTitle) || null,
+  };
+
+  const claimed = await claimStart(shop, tagName, scope);
   if (!claimed) {
     // Another click or instance already owns the active run.
     ensureRunner(shop, options);
@@ -148,7 +177,7 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   }
 
   try {
-    return await beginExport(admin, shop, tagName, options);
+    return await beginExport(admin, shop, scope.collectionId, options);
   } catch (error) {
     // The claim is already persisted, so a failure here must release it rather
     // than leave the job stuck in `querying` with no operation to poll.
@@ -157,7 +186,7 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   }
 }
 
-async function beginExport(admin, shop, tagName, options) {
+async function beginExport(admin, shop, collectionId, options) {
   // A previous run that crashed can leave a bulk query running; Shopify allows
   // only one per app per shop, so clear it before asking for a new one.
   await cancelStaleBulkOperation(admin, "QUERY");
@@ -171,7 +200,10 @@ async function beginExport(admin, shop, tagName, options) {
         userErrors { field message }
       }
     }`,
-    { variables: { query: PRODUCTS_BULK_QUERY }, label: "bulkOperationRunQuery" },
+    {
+      variables: { query: productsBulkQuery(collectionId) },
+      label: "bulkOperationRunQuery",
+    },
   );
 
   const userErrors = data?.bulkOperationRunQuery?.userErrors || [];

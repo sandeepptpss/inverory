@@ -21,6 +21,20 @@ const PRODUCT_FOR_TAG_SYNC = `#graphql
     }
   }`;
 
+// Separate document rather than a conditional field, so the unscoped path sends
+// exactly the query it always sent and costs exactly what it always cost.
+const PRODUCT_FOR_TAG_SYNC_IN_COLLECTION = `#graphql
+  query getProductForTagSyncInCollection($id: ID!, $collectionId: ID!) {
+    product(id: $id) {
+      id
+      status
+      tags
+      totalInventory
+      tracksInventory
+      inCollection(id: $collectionId)
+    }
+  }`;
+
 // Shopify treats a webhook that does not answer within a few seconds as a failed
 // delivery, so the in-request retry budget is deliberately small: one quick
 // retry absorbs a momentary throttle, and anything worse is handed back as a
@@ -58,16 +72,25 @@ export async function syncProductTagFromWebhook({ shop, admin, payload, label })
   }
 
   const productGid = toProductGid(productId);
+  const collectionId = settings.collectionId ?? null;
 
   try {
     // Shares the inventory webhook's lock so a product edit and an inventory
     // change for the same product cannot interleave their reads and writes.
     await withProductLock(`${shop}:${productGid}`, async () => {
-      const data = await graphqlWithRetry(admin, PRODUCT_FOR_TAG_SYNC, {
-        variables: { id: productGid },
-        label: "getProductForTagSync",
-        attempts: WEBHOOK_ATTEMPTS,
-      });
+      const data = await graphqlWithRetry(
+        admin,
+        collectionId ? PRODUCT_FOR_TAG_SYNC_IN_COLLECTION : PRODUCT_FOR_TAG_SYNC,
+        {
+          variables: collectionId
+            ? { id: productGid, collectionId }
+            : { id: productGid },
+          label: collectionId
+            ? "getProductForTagSyncInCollection"
+            : "getProductForTagSync",
+          attempts: WEBHOOK_ATTEMPTS,
+        },
+      );
 
       const product = data?.product;
       if (!product) return;
@@ -79,6 +102,8 @@ export async function syncProductTagFromWebhook({ shop, admin, payload, label })
         quantity: product.totalInventory,
         tracked: product.tracksInventory,
         tagName,
+        collectionScoped: Boolean(collectionId),
+        inCollection: product.inCollection,
       });
 
       if (!tagAction) return;

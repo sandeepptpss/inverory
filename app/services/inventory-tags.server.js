@@ -6,6 +6,8 @@ export const DEFAULT_AUTO_SYNC = false;
 /** Shopify rejects a tag longer than this. */
 export const MAX_TAG_LENGTH = 255;
 
+export const COLLECTION_GID_PREFIX = "gid://shopify/Collection/";
+
 /**
  * Validates and cleans a merchant-entered tag name.
  *
@@ -39,12 +41,98 @@ export function normalizeTagName(value) {
   return { ok: true, tagName };
 }
 
+/**
+ * Accepts what a picker or a form can plausibly hand back — a Collection GID, a
+ * bare numeric id, or nothing at all — and returns the canonical GID, or null
+ * for "no scope, use the whole catalog".
+ *
+ * Anything else is rejected rather than silently dropped: a malformed id that
+ * fell through as null would quietly widen the sync back to the full catalog,
+ * which is the one mistake a merchant would not notice until it had already
+ * retagged products outside the collection they picked.
+ */
+export function normalizeCollectionId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "all") {
+    return { ok: true, collectionId: null };
+  }
+
+  if (/^\d+$/.test(raw)) {
+    return { ok: true, collectionId: `${COLLECTION_GID_PREFIX}${raw}` };
+  }
+
+  const legacyId = raw.startsWith(COLLECTION_GID_PREFIX)
+    ? raw.slice(COLLECTION_GID_PREFIX.length)
+    : null;
+  if (legacyId && /^\d+$/.test(legacyId)) {
+    return { ok: true, collectionId: raw };
+  }
+
+  return { ok: false, error: "That is not a valid collection." };
+}
+
+/** The numeric id Shopify's `products(query:)` search filter expects. */
+export function collectionLegacyId(collectionId) {
+  const raw = String(collectionId ?? "").trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) return raw;
+  const legacyId = raw.startsWith(COLLECTION_GID_PREFIX)
+    ? raw.slice(COLLECTION_GID_PREFIX.length)
+    : null;
+  return legacyId && /^\d+$/.test(legacyId) ? legacyId : null;
+}
+
 export async function getSettings(shop) {
   const setting = await db.tagAutomationSetting.findUnique({ where: { shop } });
   return {
     tagName: setting?.tagName || DEFAULT_TAG_NAME,
     autoSyncEnabled: setting?.autoSyncEnabled ?? DEFAULT_AUTO_SYNC,
+    // Normalised on the way out too, so a row written before this column
+    // existed (or an empty string from an older form post) reads as "no scope"
+    // rather than as a collection whose id is "".
+    collectionId: setting?.collectionId || null,
+    collectionTitle: (setting?.collectionId && setting?.collectionTitle) || null,
   };
+}
+
+const COLLECTIONS_PAGE = `#graphql
+  query dashboardCollections($first: Int!, $after: String) {
+    collections(first: $first, after: $after, sortKey: TITLE) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id title }
+    }
+  }`;
+
+const COLLECTIONS_PAGE_SIZE = 250;
+const COLLECTIONS_MAX_PAGES = 5;
+
+/**
+ * The collections the picker offers. Paged rather than capped at one request so
+ * a store with a few hundred collections can still find the one it wants; the
+ * page ceiling keeps a pathological catalog from stalling the dashboard load.
+ */
+export async function fetchCollections(admin) {
+  const collections = [];
+  let after = null;
+
+  for (let page = 0; page < COLLECTIONS_MAX_PAGES; page += 1) {
+    const data = await graphqlWithRetry(admin, COLLECTIONS_PAGE, {
+      variables: { first: COLLECTIONS_PAGE_SIZE, after },
+      label: "dashboardCollections",
+      attempts: 2,
+    });
+
+    const connection = data?.collections;
+    for (const node of connection?.nodes ?? []) {
+      if (node?.id) collections.push({ id: node.id, title: node.title || node.id });
+    }
+
+    if (!connection?.pageInfo?.hasNextPage) break;
+    after = connection.pageInfo.endCursor;
+    if (!after) break;
+  }
+
+  return collections;
 }
 
 export async function getTagName(shop) {
@@ -52,11 +140,28 @@ export async function getTagName(shop) {
   return settings.tagName;
 }
 
-export async function setSettings(shop, { tagName, autoSyncEnabled }) {
+export async function setSettings(
+  shop,
+  { tagName, autoSyncEnabled, collectionId, collectionTitle },
+) {
   if (tagName !== undefined) {
     const validated = normalizeTagName(tagName);
     if (!validated.ok) throw new Error(validated.error);
     tagName = validated.tagName;
+  }
+
+  // `undefined` leaves the scope alone; `null` (or "") clears it back to the
+  // whole catalog. Each caller only sends the fields its own form owns, so a
+  // save from one card can never revert what another card changed.
+  let scope;
+  if (collectionId !== undefined) {
+    const validated = normalizeCollectionId(collectionId);
+    if (!validated.ok) throw new Error(validated.error);
+    const title = String(collectionTitle ?? "").trim();
+    scope = {
+      collectionId: validated.collectionId,
+      collectionTitle: validated.collectionId ? title || null : null,
+    };
   }
 
   const existing = await db.tagAutomationSetting.findUnique({
@@ -74,13 +179,20 @@ export async function setSettings(shop, { tagName, autoSyncEnabled }) {
     update: {
       ...(tagName !== undefined ? { tagName } : {}),
       ...(autoSyncEnabled !== undefined ? { autoSyncEnabled } : {}),
+      ...(scope ?? {}),
     },
     create: {
       shop,
       tagName: finalTagName,
       autoSyncEnabled: finalAutoSync,
+      collectionId: scope?.collectionId ?? existing?.collectionId ?? null,
+      collectionTitle: scope?.collectionTitle ?? existing?.collectionTitle ?? null,
     },
   });
+}
+
+export async function setCollectionScope(shop, collectionId, collectionTitle) {
+  return setSettings(shop, { collectionId, collectionTitle });
 }
 
 export async function setTagName(shop, tagName) {
@@ -126,9 +238,29 @@ function toQuantity(value) {
   return null;
 }
 
-// Pure decision logic, kept separate from I/O so it can be unit tested directly.
-export function resolveTagAction({ status, tags, quantity, tracked, tagName }) {
+/**
+ * Pure decision logic, kept separate from I/O so it can be unit tested directly.
+ *
+ * `collectionScoped` / `inCollection` carry the optional collection scope. When
+ * a collection is selected, a product outside it is left exactly as it is —
+ * including a tag it already carries, which this app may well have put there
+ * under a previous scope. Stripping those would make changing the selection a
+ * destructive act on products the merchant did not ask about.
+ */
+export function resolveTagAction({
+  status,
+  tags,
+  quantity,
+  tracked,
+  tagName,
+  collectionScoped = false,
+  inCollection = false,
+}) {
   if (status !== "ACTIVE") {
+    return null;
+  }
+
+  if (collectionScoped && inCollection !== true) {
     return null;
   }
 

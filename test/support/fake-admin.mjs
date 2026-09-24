@@ -17,7 +17,11 @@ export class FakeAdmin {
     this.failNext = 0;
 
     for (const product of products) {
-      this.products.set(product.id, { ...product, tags: [...(product.tags ?? [])] });
+      this.products.set(product.id, {
+        ...product,
+        tags: [...(product.tags ?? [])],
+        collectionIds: [...(product.collectionIds ?? [])],
+      });
       for (const itemId of product.inventoryItemIds ?? []) {
         this.inventoryItems.set(`gid://shopify/InventoryItem/${itemId}`, product.id);
       }
@@ -44,18 +48,39 @@ export class FakeAdmin {
     }
 
     switch (name) {
-      case "getProductForInventoryItem": {
+      case "getProductForInventoryItem":
+      case "getProductForInventoryItemInCollection": {
         const productId = this.inventoryItems.get(variables.id);
         const product = productId ? this.products.get(productId) : null;
         return json({
           data: {
-            inventoryItem: product ? { variant: { product: view(product) } } : null,
+            inventoryItem: product
+              ? { variant: { product: view(product, variables.collectionId) } }
+              : null,
           },
         });
       }
 
       case "getProductForTagSync":
-        return json({ data: { product: view(this.products.get(variables.id) ?? null) } });
+      case "getProductForTagSyncInCollection":
+        return json({
+          data: {
+            product: view(
+              this.products.get(variables.id) ?? null,
+              variables.collectionId,
+            ),
+          },
+        });
+
+      case "dashboardCollections":
+        return json({
+          data: {
+            collections: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: this.collections ?? [],
+            },
+          },
+        });
 
       case "addOutOfStockTag": {
         const product = this.products.get(variables.id);
@@ -83,7 +108,7 @@ export class FakeAdmin {
   }
 }
 
-function view(product) {
+function view(product, collectionId) {
   if (!product) return null;
   return {
     id: product.id,
@@ -91,6 +116,12 @@ function view(product) {
     tags: [...product.tags],
     totalInventory: product.totalInventory,
     tracksInventory: product.tracksInventory,
+    // Only present when the caller asked for it, exactly like the real API:
+    // a handler that reads it unconditionally would see `undefined` on the
+    // unscoped query rather than a silently friendly `false`.
+    ...(collectionId
+      ? { inCollection: (product.collectionIds ?? []).includes(collectionId) }
+      : {}),
   };
 }
 

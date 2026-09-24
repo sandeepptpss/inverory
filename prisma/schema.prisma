@@ -37,11 +37,24 @@ model TagAutomationSetting {
   shop            String  @id
   tagName         String  @default("out-of-stock-hidden")
   autoSyncEnabled Boolean @default(false)
+
+  // Optional sync scope. NULL means "the whole catalog", which is the behaviour
+  // the app shipped with. When set, only products in this collection are
+  // considered by Auto Sync and by the manual catalog sync.
+  collectionId    String?
+  // Cached for display only — the merchant can rename a collection in Shopify
+  // and the picker falls back to this label until the list is reloaded.
+  collectionTitle String?
 }
 
 model BulkSyncJob {
   shop                          String  @id
   tagName                       String
+  // The scope this run was started with, copied from the settings at claim time
+  // so that changing the selection mid-run cannot move the goalposts of a job
+  // that is already exporting. NULL means the whole catalog.
+  collectionId                  String?
+  collectionTitle               String?
   // querying | downloading | tagging | untagging | completed | failed | cancelled
   status                        String
   queryBulkOperationId          String?

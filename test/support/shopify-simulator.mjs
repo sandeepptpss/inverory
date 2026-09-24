@@ -75,6 +75,17 @@ export class ShopifySimulator {
         ? options.catalog
         : (CATALOGS[options.catalog ?? "mixed"] ?? CATALOGS.mixed);
 
+    // Collection-scoped runs: how many products the filtered export returns,
+    // and the builder for them. Left unset, a scoped query is still recorded
+    // but serves the same catalog, so existing suites are unaffected.
+    this.collectionProductCount = options.collectionProductCount ?? null;
+    this.collectionCatalog =
+      typeof options.collectionCatalog === "function"
+        ? options.collectionCatalog
+        : null;
+    /** Every `products(query: …)` filter the service asked Shopify for. */
+    this.bulkQueries = [];
+
     this.calls = [];
     this.operations = new Map();
     this.uploads = new Map();
@@ -121,8 +132,22 @@ export class ShopifySimulator {
     }
 
     switch (name) {
-      case "startBulkProductQuery":
-        return json({ data: { bulkOperationRunQuery: this.#createOperation("QUERY") } });
+      case "startBulkProductQuery": {
+        const filter = (variables.query.match(/products\(query:\s*"([^"]*)"/) || [])[1] ?? "";
+        this.bulkQueries.push(filter);
+        const scoped = /collection_id:(\d+)/.test(filter);
+        return json({
+          data: {
+            bulkOperationRunQuery: this.#createOperation("QUERY", {
+              rows:
+                scoped && this.collectionProductCount !== null
+                  ? this.collectionProductCount
+                  : this.productCount,
+              catalog: scoped && this.collectionCatalog ? "collection" : "default",
+            }),
+          },
+        });
+      }
 
       case "bulkOperationStatus":
         return json({ data: { node: this.#pollOperation(variables.id) } });
@@ -188,8 +213,9 @@ export class ShopifySimulator {
       url: null,
       objectCount: "0",
       polls: 0,
-      rows: type === "QUERY" ? this.productCount : extra.rows,
+      rows: type === "QUERY" ? (extra.rows ?? this.productCount) : extra.rows,
       field: extra.field,
+      catalog: extra.catalog ?? "default",
     };
     this.operations.set(id, op);
     this.current[type] = op;
@@ -235,7 +261,7 @@ export class ShopifySimulator {
     op.objectCount = String(op.rows);
     op.url =
       op.type === "QUERY"
-        ? `${this.origin}/export/${op.rows}`
+        ? `${this.origin}/export/${op.rows}/${op.catalog}`
         : `${this.origin}/mutation-result/${op.field}/${op.rows}`;
     return publicView(op);
   }
@@ -275,10 +301,14 @@ export class ShopifySimulator {
       return;
     }
 
-    const exportMatch = url.pathname.match(/^\/export\/(\d+)$/);
+    const exportMatch = url.pathname.match(/^\/export\/(\d+)(?:\/(\w+))?$/);
     if (exportMatch) {
+      const build =
+        exportMatch[2] === "collection" && this.collectionCatalog
+          ? this.collectionCatalog
+          : this.catalog;
       res.writeHead(200, { "content-type": "application/jsonl" });
-      await streamLines(res, Number(exportMatch[1]), (i) => JSON.stringify(this.catalog(i)));
+      await streamLines(res, Number(exportMatch[1]), (i) => JSON.stringify(build(i)));
       return;
     }
 

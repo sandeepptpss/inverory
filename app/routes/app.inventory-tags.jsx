@@ -5,7 +5,9 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
+  fetchCollections,
   getSettings,
+  normalizeCollectionId,
   normalizeTagName,
   setSettings,
 } from "../services/inventory-tags.server";
@@ -20,6 +22,7 @@ import {
   bulkSyncView,
   isBulkSyncActive,
   isBulkSyncFinished,
+  syncScopeLabel,
 } from "../lib/bulk-sync-status";
 
 function ZapIcon({ size = 18, className = "" }) {
@@ -95,13 +98,24 @@ function PlayIcon({ size = 14, className = "" }) {
 }
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
   const job = await tickBulkSync(session.shop);
+
+  // The picker is a convenience; a store whose collection list cannot be read
+  // must still get a working dashboard, with the saved selection intact.
+  const collections = await fetchCollections(admin).catch((error) => {
+    console.error("Could not load collections:", error);
+    return null;
+  });
 
   return {
     tagName: settings.tagName,
     autoSyncEnabled: settings.autoSyncEnabled,
+    collectionId: settings.collectionId,
+    collectionTitle: settings.collectionTitle,
+    collections: collections ?? [],
+    collectionsUnavailable: collections === null,
     job,
   };
 };
@@ -117,14 +131,32 @@ export const action = async ({ request }) => {
       return { intent, error: validated.error };
     }
 
+    const collection = normalizeCollectionId(formData.get("collectionId"));
+    if (!collection.ok) {
+      return { intent, error: collection.error };
+    }
+    const collectionTitle = collection.collectionId
+      ? String(formData.get("collectionTitle") ?? "").trim() || null
+      : null;
+
     try {
-      // Only the tag name: sending the toggle's client-side value along with it
-      // would silently revert a change made in another tab.
-      await setSettings(session.shop, { tagName: validated.tagName });
-      return { intent, tagName: validated.tagName };
+      // The tag name and the scope, which this form owns. The Auto Sync toggle
+      // is deliberately left out: sending its client-side value along would
+      // silently revert a change made in another tab.
+      await setSettings(session.shop, {
+        tagName: validated.tagName,
+        collectionId: collection.collectionId,
+        collectionTitle,
+      });
+      return {
+        intent,
+        tagName: validated.tagName,
+        collectionId: collection.collectionId,
+        collectionTitle,
+      };
     } catch (error) {
-      console.error("Failed to save the tag name:", error);
-      return { intent, error: "Could not save the tag name. Please try again." };
+      console.error("Failed to save the settings:", error);
+      return { intent, error: "Could not save the settings. Please try again." };
     }
   }
 
@@ -150,8 +182,13 @@ export const action = async ({ request }) => {
 
   if (intent === "run-sync") {
     try {
+      // Read from the database rather than from the form, so the run always
+      // uses the scope that is actually saved.
       const settings = await getSettings(session.shop);
-      const job = await startBulkSync(admin, session.shop, settings.tagName);
+      const job = await startBulkSync(admin, session.shop, settings.tagName, {
+        collectionId: settings.collectionId,
+        collectionTitle: settings.collectionTitle,
+      });
       return { intent, job };
     } catch (error) {
       console.error("Failed to start bulk sync:", error);
@@ -184,6 +221,10 @@ export default function InventoryTagsPage() {
   const {
     tagName: initialTagName,
     autoSyncEnabled: initialAutoSync,
+    collectionId: initialCollectionId,
+    collectionTitle: initialCollectionTitle,
+    collections,
+    collectionsUnavailable,
     job: initialJob,
   } = useLoaderData();
 
@@ -199,6 +240,47 @@ export default function InventoryTagsPage() {
   // the old one behind on every product that already carries it.
   const [savedTagName, setSavedTagName] = useState(initialTagName);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(initialAutoSync);
+
+  const [collectionId, setCollectionId] = useState(initialCollectionId || "");
+  const [collectionTitle, setCollectionTitle] = useState(
+    initialCollectionTitle || "",
+  );
+  // What is actually stored, so both cards can state the scope a sync would
+  // really run with rather than the one the merchant is part-way through
+  // choosing.
+  const [savedCollectionId, setSavedCollectionId] = useState(
+    initialCollectionId || "",
+  );
+  const [savedCollectionTitle, setSavedCollectionTitle] = useState(
+    initialCollectionTitle || "",
+  );
+
+  // A collection saved earlier may not be in the loaded page of collections (a
+  // very long list, or a list that failed to load). Keeping it as an option
+  // means opening the dropdown cannot silently reset the scope to "all".
+  const collectionOptions = (() => {
+    const options = collections ?? [];
+    if (!savedCollectionId || options.some((c) => c.id === savedCollectionId)) {
+      return options;
+    }
+    return [{ id: savedCollectionId, title: savedCollectionTitle || savedCollectionId }, ...options];
+  })();
+
+  const handleCollectionChange = (nextId) => {
+    setCollectionId(nextId);
+    setCollectionTitle(
+      collectionOptions.find((c) => c.id === nextId)?.title ?? "",
+    );
+  };
+
+  const scopeDirty =
+    collectionId !== savedCollectionId ||
+    (Boolean(collectionId) && collectionTitle !== savedCollectionTitle);
+
+  const savedScopeLabel = syncScopeLabel({
+    collectionId: savedCollectionId || null,
+    collectionTitle: savedCollectionTitle || null,
+  });
 
   const isSaving = settingsFetcher.state !== "idle";
 
@@ -246,6 +328,17 @@ export default function InventoryTagsPage() {
     }
     if (settingsFetcher.data?.autoSyncEnabled !== undefined) {
       setAutoSyncEnabled(settingsFetcher.data.autoSyncEnabled);
+    }
+    if (
+      settingsFetcher.data?.intent === "save-settings" &&
+      !settingsFetcher.data.error
+    ) {
+      const savedId = settingsFetcher.data.collectionId || "";
+      const savedTitle = settingsFetcher.data.collectionTitle || "";
+      setCollectionId(savedId);
+      setCollectionTitle(savedTitle);
+      setSavedCollectionId(savedId);
+      setSavedCollectionTitle(savedTitle);
     }
 
     if (settingsFetcher.data?.intent === "save-settings") {
@@ -574,6 +667,59 @@ export default function InventoryTagsPage() {
         .save-btn:disabled {
           background: #8c9196;
           cursor: not-allowed;
+        }
+
+        .scope-select {
+          width: 100%;
+          max-width: 380px;
+          height: 38px;
+          padding: 8px 12px;
+          font-size: 14px;
+          border: 1.5px solid #babfc3;
+          border-radius: 8px;
+          background: #ffffff;
+          color: #202223;
+          box-sizing: border-box;
+          cursor: pointer;
+          transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .scope-select:focus {
+          outline: none;
+          border-color: #008060;
+          box-shadow: 0 0 0 3px rgba(0, 128, 96, 0.2);
+        }
+        .scope-select:disabled {
+          background: #f6f6f7;
+          cursor: not-allowed;
+        }
+
+        .scope-hint {
+          font-size: 12.5px;
+          color: #6d7175;
+          line-height: 1.5;
+        }
+
+        .scope-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          background: #eef4ff;
+          border: 1px solid #c8dcff;
+          color: #1e3a8a;
+          padding: 3px 10px;
+          border-radius: 6px;
+          font-size: 12px;
+          font-weight: 600;
+        }
+
+        .scope-warning {
+          background: #fffbeb;
+          border: 1px solid #fde68a;
+          border-radius: 8px;
+          padding: 10px 14px;
+          font-size: 12.5px;
+          line-height: 1.5;
+          color: #78350f;
         }
 
         .tag-preview-group {
@@ -936,14 +1082,6 @@ export default function InventoryTagsPage() {
                     required
                   />
                 </div>
-
-                <button
-                  type="submit"
-                  className="save-btn"
-                  disabled={isSaving}
-                >
-                  {isSaving ? "Saving…" : "Save tag"}
-                </button>
               </div>
 
               <div className="tag-preview-group">
@@ -960,6 +1098,79 @@ export default function InventoryTagsPage() {
                   that tag in bulk from Shopify admin if you no longer want it.
                 </div>
               )}
+
+              {/* Sync scope */}
+              <label
+                htmlFor="collectionId"
+                className="section-label"
+                style={{ marginTop: "10px" }}
+              >
+                Sync scope
+              </label>
+
+              <select
+                id="collectionId"
+                name="collectionId"
+                className="scope-select"
+                value={collectionId}
+                onChange={(e) => handleCollectionChange(e.target.value)}
+                disabled={collectionsUnavailable && !savedCollectionId}
+              >
+                <option value="">Entire product catalog (all products)</option>
+                {collectionOptions.map((collection) => (
+                  <option key={collection.id} value={collection.id}>
+                    {collection.title}
+                  </option>
+                ))}
+              </select>
+              {/* Titles are not resolvable from the id alone on the server, so
+                  the label the merchant picked travels with the selection. */}
+              <input
+                type="hidden"
+                name="collectionTitle"
+                value={collectionTitle}
+              />
+
+              <div className="scope-hint">
+                {savedCollectionId ? (
+                  <>
+                    Both Automatic Sync and Manual Full Catalog Sync currently
+                    apply to <span className="scope-chip">{savedScopeLabel}</span>.
+                    Products outside it are never tagged or untagged by this app.
+                  </>
+                ) : (
+                  <>
+                    No collection selected &mdash; both syncs run across your entire
+                    active product catalog, exactly as before.
+                  </>
+                )}
+              </div>
+
+              {collectionsUnavailable && (
+                <div className="scope-warning">
+                  Could not load your collections right now, so the list may be
+                  incomplete. Your saved scope is unchanged.
+                </div>
+              )}
+
+              {scopeDirty && (
+                <div className="scope-warning">
+                  Scope change not saved yet. Products already tagged under the
+                  previous scope keep their tag &mdash; run a sync after saving to
+                  bring the new scope in line.
+                </div>
+              )}
+
+              <div className="tag-input-row">
+                <button
+                  type="submit"
+                  className="save-btn"
+                  disabled={isSaving}
+                >
+                  {isSaving ? "Saving…" : "Save settings"}
+                </button>
+              </div>
+
             </settingsFetcher.Form>
 
             {/* Rules Visual Grid */}
@@ -1007,6 +1218,9 @@ export default function InventoryTagsPage() {
                   <strong>Safety guardrail:</strong> Draft and archived products are never
                   modified. Products that don&rsquo;t track inventory are never tagged &mdash; and
                   the tag is removed if they already carry it.
+                  {savedCollectionId
+                    ? ` Both rules apply only to products in ${savedCollectionTitle || "the selected collection"}.`
+                    : ""}
                 </span>
               </div>
             </div>
@@ -1021,14 +1235,17 @@ export default function InventoryTagsPage() {
                 <span className="header-icon"><RefreshIcon size={20} /></span> Manual Full Catalog Sync
               </h2>
               <p className="dash-subtitle">
-                Scans your entire active product catalog in the background and applies or removes tags to match current inventory.
+                {savedCollectionId
+                  ? "Scans the active products in the selected collection in the background and applies or removes tags to match current inventory."
+                  : "Scans your entire active product catalog in the background and applies or removes tags to match current inventory."}
               </p>
             </div>
+            <span className="scope-chip">{savedScopeLabel}</span>
           </div>
 
           <div className="dash-card-body">
             <p style={{ margin: 0, fontSize: "13.5px", color: "#6d7175", lineHeight: "1.5" }}>
-              Auto Sync handles ongoing inventory updates as they happen. Use <strong>Run sync now</strong> for an initial catalog scan when setting up the app, or anytime you change the tag name.
+              Auto Sync handles ongoing inventory updates as they happen. Use <strong>Run sync now</strong> for an initial scan when setting up the app, or anytime you change the tag name or the sync scope.
             </p>
 
             <div className="manual-sync-actions">
@@ -1089,6 +1306,11 @@ export default function InventoryTagsPage() {
                   <>
                     <s-banner tone={view.tone} heading={view.heading}>
                       <s-paragraph>{statusText}</s-paragraph>
+                      {job?.tagged === 0 && job?.untagged === 0 && (job?.processed || 0) > 0 && (
+                        <s-paragraph color="subdued">
+                          All products are already up to date with your automation rules (no tags needed to be added or removed).
+                        </s-paragraph>
+                      )}
                       {elapsed && (
                         <s-paragraph color="subdued">Took {elapsed}.</s-paragraph>
                       )}
@@ -1130,6 +1352,16 @@ export function ErrorBoundary() {
   return boundary.error(useRouteError());
 }
 
+export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
+  // Polling checks the sync status every 2 seconds. Re-running the route loader
+  // on every check would wastefully refetch collections and settings from Shopify.
+  if (actionResult?.intent === "check-sync") {
+    return false;
+  }
+  return defaultShouldRevalidate;
+}
+
 export const headers = (headersArgs) => {
   return boundary.headers(headersArgs);
 };
+
