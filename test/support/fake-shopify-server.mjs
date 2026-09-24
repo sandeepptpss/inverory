@@ -21,7 +21,21 @@ export function setWebhookResult(result) {
   currentWebhookResult = result;
 }
 
+let currentAdminSession = null;
+
+/** What `authenticate.admin` resolves to for the dashboard route's loader/action. */
+export function setAdminSession(value) {
+  currentAdminSession = value;
+}
+
 export const authenticate = {
+  admin: async () => {
+    if (!currentAdminSession) throw new Error("No admin session registered for this test");
+    return {
+      session: { shop: currentAdminSession.shop },
+      admin: currentAdminSession.admin,
+    };
+  },
   webhook: async (request) => {
     if (typeof currentWebhookResult === "function") {
       return currentWebhookResult(request);
@@ -36,5 +50,5 @@ export const authenticate = {
   },
 };
 export const apiVersion = "2026-07";
-export default { unauthenticated, authenticate, setAdmin, setWebhookResult };
+export default { unauthenticated, authenticate, setAdmin, setAdminSession, setWebhookResult };
 

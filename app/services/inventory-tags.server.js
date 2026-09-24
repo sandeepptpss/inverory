@@ -7,6 +7,22 @@ export const DEFAULT_AUTO_SYNC = false;
 export const MAX_TAG_LENGTH = 255;
 
 export const COLLECTION_GID_PREFIX = "gid://shopify/Collection/";
+/** Width of the collectionTitle columns; Shopify allows titles this long. */
+export const MAX_COLLECTION_TITLE_LENGTH = 255;
+
+/**
+ * The cached title is display-only, so an over-long one is shortened rather
+ * than allowed to fail the whole settings save. Cut on code points so an emoji
+ * is never split into half a surrogate pair, which MySQL rejects outright.
+ */
+export function clipCollectionTitle(value) {
+  const title = String(value ?? "").trim();
+  if (!title) return null;
+  const chars = Array.from(title);
+  return chars.length > MAX_COLLECTION_TITLE_LENGTH
+    ? chars.slice(0, MAX_COLLECTION_TITLE_LENGTH).join("")
+    : title;
+}
 
 /**
  * Validates and cleans a merchant-entered tag name.
@@ -135,6 +151,30 @@ export async function fetchCollections(admin) {
   return collections;
 }
 
+const COLLECTION_BY_ID = `#graphql
+  query dashboardCollection($id: ID!) {
+    collection(id: $id) { id title }
+  }`;
+
+/**
+ * The saved scope's collection as Shopify has it right now: `{ id, title }`,
+ * or null when it no longer exists. Throws when Shopify could not be asked, so
+ * callers can tell "deleted" apart from "unknown" and never block on the latter.
+ *
+ * Without this, a deleted collection fails silently in both directions: the
+ * manual sync exports zero products and reports "Sync complete", and Auto Sync
+ * skips every product without saying why.
+ */
+export async function fetchCollection(admin, collectionId) {
+  const data = await graphqlWithRetry(admin, COLLECTION_BY_ID, {
+    variables: { id: collectionId },
+    label: "dashboardCollection",
+    attempts: 2,
+  });
+  const node = data?.collection;
+  return node?.id ? { id: node.id, title: node.title || node.id } : null;
+}
+
 export async function getTagName(shop) {
   const settings = await getSettings(shop);
   return settings.tagName;
@@ -157,10 +197,9 @@ export async function setSettings(
   if (collectionId !== undefined) {
     const validated = normalizeCollectionId(collectionId);
     if (!validated.ok) throw new Error(validated.error);
-    const title = String(collectionTitle ?? "").trim();
     scope = {
       collectionId: validated.collectionId,
-      collectionTitle: validated.collectionId ? title || null : null,
+      collectionTitle: validated.collectionId ? clipCollectionTitle(collectionTitle) : null,
     };
   }
 

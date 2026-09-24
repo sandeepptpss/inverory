@@ -72,6 +72,15 @@ export class FakeAdmin {
           },
         });
 
+      case "dashboardCollection": {
+        // null for an id the store does not have, exactly like the real API
+        // for a collection that has been deleted.
+        const found = (this.collections ?? []).find((c) => c.id === variables.id);
+        return json({
+          data: { collection: found ? { id: found.id, title: found.title } : null },
+        });
+      }
+
       case "dashboardCollections":
         return json({
           data: {

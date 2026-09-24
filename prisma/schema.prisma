@@ -35,7 +35,9 @@ model Session {
 
 model TagAutomationSetting {
   shop            String  @id
-  tagName         String  @default("out-of-stock-hidden")
+  // Shopify accepts tags up to 255 characters, which is what the form allows.
+  // Prisma's MySQL default for String is VARCHAR(191), which rejected the save.
+  tagName         String  @default("out-of-stock-hidden") @db.VarChar(255)
   autoSyncEnabled Boolean @default(false)
 
   // Optional sync scope. NULL means "the whole catalog", which is the behaviour
@@ -44,17 +46,17 @@ model TagAutomationSetting {
   collectionId    String?
   // Cached for display only — the merchant can rename a collection in Shopify
   // and the picker falls back to this label until the list is reloaded.
-  collectionTitle String?
+  collectionTitle String? @db.VarChar(255)
 }
 
 model BulkSyncJob {
   shop                          String  @id
-  tagName                       String
+  tagName                       String  @db.VarChar(255)
   // The scope this run was started with, copied from the settings at claim time
   // so that changing the selection mid-run cannot move the goalposts of a job
   // that is already exporting. NULL means the whole catalog.
   collectionId                  String?
-  collectionTitle               String?
+  collectionTitle               String? @db.VarChar(255)
   // querying | downloading | tagging | untagging | completed | failed | cancelled
   status                        String
   queryBulkOperationId          String?

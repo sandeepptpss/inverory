@@ -85,6 +85,8 @@ export class ShopifySimulator {
         : null;
     /** Every `products(query: …)` filter the service asked Shopify for. */
     this.bulkQueries = [];
+    /** The store's collections, for the dashboard's scope lookups. */
+    this.collections = options.collections ?? [];
 
     this.calls = [];
     this.operations = new Map();
@@ -151,6 +153,11 @@ export class ShopifySimulator {
 
       case "bulkOperationStatus":
         return json({ data: { node: this.#pollOperation(variables.id) } });
+
+      case "dashboardCollection": {
+        const found = this.collections.find((c) => c.id === variables.id);
+        return json({ data: { collection: found ?? null } });
+      }
 
       case "currentBulkOperation":
         return json({ data: { currentBulkOperation: this.current[variables.type] } });

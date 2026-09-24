@@ -3,6 +3,7 @@ import os from "node:os";
 import db from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import {
+  clipCollectionTitle,
   collectionLegacyId,
   resolveTagAction,
   tagForAction,
@@ -35,8 +36,13 @@ const POLL_INTERVAL_MS = num(process.env.BULK_SYNC_POLL_MS, 2_500);
 const LEASE_MS = num(process.env.BULK_SYNC_LEASE_MS, 60_000);
 /** Fail a job whose counters have not moved in this long. */
 const NO_PROGRESS_TIMEOUT_MS = num(process.env.BULK_SYNC_STALL_MS, 30 * 60_000);
-/** Hard ceiling, so a job can never run forever even if it keeps inching along. */
-const MAX_JOB_DURATION_MS = num(process.env.BULK_SYNC_MAX_MS, 6 * 60 * 60_000);
+/**
+ * Hard ceiling, so a job can never run forever even if it keeps inching along.
+ * Shopify itself stops a bulk mutation after 24 hours; a tighter cap here (it
+ * was 6 hours) cancelled healthy runs on catalogs of a few hundred thousand
+ * products, which can legitimately take most of a working day.
+ */
+const MAX_JOB_DURATION_MS = num(process.env.BULK_SYNC_MAX_MS, 24 * 60 * 60_000);
 /** Consecutive retryable step failures tolerated before the job is failed. */
 const MAX_STEP_ATTEMPTS = num(process.env.BULK_SYNC_MAX_ATTEMPTS, 5);
 /** DB write cadence while streaming the export. */
@@ -166,7 +172,7 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   // already asked Shopify for a particular export.
   const scope = {
     collectionId: options.collectionId ?? null,
-    collectionTitle: (options.collectionId && options.collectionTitle) || null,
+    collectionTitle: options.collectionId ? clipCollectionTitle(options.collectionTitle) : null,
   };
 
   const claimed = await claimStart(shop, tagName, scope);
@@ -305,10 +311,6 @@ async function resolveAdmin(shop, options) {
 }
 
 async function runLoop(shop, options) {
-  // Resolved once per runner rather than borrowed from the request, so the
-  // client outlives the HTTP request that started the sync.
-  const admin = await resolveAdmin(shop, options);
-
   for (;;) {
     const current = await getBulkSyncJob(shop);
     if (!isBulkSyncActive(current)) return;
@@ -320,11 +322,20 @@ async function runLoop(shop, options) {
       continue;
     }
 
-    const expired = await enforceWatchdog(admin, job);
-    if (expired) return;
-
     let waitMs = POLL_INTERVAL_MS;
     try {
+      // Resolved on every pass, never borrowed from the request and never held
+      // for the whole run. Offline access tokens expire after an hour, and the
+      // library only refreshes one when a client is created — so a runner that
+      // kept its first client failed every call with a 401 about an hour into a
+      // large sync, while Shopify carried on applying the tags regardless.
+      // Loading the stored session is one DB read; the token itself is only
+      // refreshed when it is close to expiry.
+      const admin = await resolveAdmin(shop, options);
+
+      const expired = await enforceWatchdog(admin, job);
+      if (expired) return;
+
       const result = await runStep(admin, job);
       if (!isBulkSyncActive(result.job)) {
         await releaseLease(shop);
@@ -369,8 +380,34 @@ async function handleStepError(shop, job, error) {
   return true;
 }
 
-function friendlyError(error) {
+/**
+ * graphqlWithRetry / fetchWithRetry prefix their failures with the operation
+ * label ("bulkOperationStatus: [{…}]"). Those are for the log, not for a
+ * merchant; the messages this module writes itself start with a capital.
+ */
+const TECHNICAL_MESSAGE = /^[a-z][A-Za-z]*: /;
+
+/**
+ * What the dashboard shows when a sync fails. The full technical error is
+ * already in the server log by the time this is called.
+ */
+export function friendlyError(error) {
+  if (error?.exhausted) {
+    return "Shopify is busy or temporarily unavailable, so the sync could not continue. Please try again in a few minutes.";
+  }
+
   const message = String(error?.message || "Unknown error");
+
+  if (TECHNICAL_MESSAGE.test(message)) {
+    if (/HTTP 40[13]\b|ACCESS_DENIED|access denied/i.test(message)) {
+      return "Shopify denied the app access to your products. Reload the app so it can refresh its permissions, then try again.";
+    }
+    return "Shopify returned an unexpected error. Please try again.";
+  }
+  if (/^Malformed JSONL/.test(message)) {
+    return "Shopify sent back a result file the app could not read. Please run the sync again.";
+  }
+
   return message.length > 500 ? `${message.slice(0, 497)}…` : message;
 }
 
@@ -412,9 +449,20 @@ async function enforceWatchdog(admin, job) {
 
   let reason = null;
   if (now - startedAt > MAX_JOB_DURATION_MS) {
-    reason = `Sync exceeded the maximum run time of ${Math.round(MAX_JOB_DURATION_MS / 60_000)} minutes.`;
+    reason = `Sync exceeded the maximum run time of ${formatLimit(MAX_JOB_DURATION_MS)}.`;
   } else if (now - lastProgressAt > NO_PROGRESS_TIMEOUT_MS) {
-    reason = `Sync made no progress for ${Math.round(NO_PROGRESS_TIMEOUT_MS / 60_000)} minutes and was stopped.`;
+    // Nothing records progress while the app is down, so a restart or a
+    // sleeping laptop that outlasted the stall window looked exactly like a
+    // wedged operation — and the watchdog cancelled work Shopify was still
+    // doing. Ask Shopify before calling it a stall.
+    if (await operationStillMoving(admin, job)) {
+      await db.bulkSyncJob.update({
+        where: { shop: job.shop },
+        data: { lastProgressAt: new Date() },
+      });
+      return false;
+    }
+    reason = `Sync made no progress for ${formatLimit(NO_PROGRESS_TIMEOUT_MS)} and was stopped.`;
   }
 
   if (!reason) return false;
@@ -427,6 +475,29 @@ async function enforceWatchdog(admin, job) {
   await cleanupFiles(job);
   await finish(job.shop, SYNC_STATUS.failed, { errorMessage: reason });
   return true;
+}
+
+/**
+ * Whether the Shopify operation behind a job that looks stalled is in fact
+ * fine. A finished operation (in any state) counts, so the step that follows
+ * reports its real outcome rather than "no progress"; so does one that is
+ * queued, or running with a count past the last one recorded here.
+ */
+async function operationStillMoving(admin, job) {
+  const operationId = currentOperationId(job);
+  if (!operationId) return false;
+
+  const op = await fetchBulkOperationStatus(admin, operationId).catch(() => null);
+  if (!op) return false;
+  if (!IN_FLIGHT.has(op.status) || op.status === "CREATED") return true;
+  // While downloading, the counter is this app's own scan, not Shopify's.
+  if (job.status === SYNC_STATUS.downloading) return false;
+  return op.status === "RUNNING" && Number(op.objectCount || 0) > Number(job.lastProgressCount || 0);
+}
+
+function formatLimit(ms) {
+  const minutes = Math.round(ms / 60_000);
+  return minutes >= 120 ? `${Math.round(minutes / 60)} hours` : `${minutes} minutes`;
 }
 
 /**
@@ -591,7 +662,10 @@ async function stageJsonlUpload(admin, filePath, filename) {
   const uploadResponse = await fetch(target.url, { method: "POST", body: form });
   if (!uploadResponse.ok) {
     const body = await uploadResponse.text().catch(() => "");
-    throw new Error(`Staged upload failed: ${uploadResponse.status} ${body.slice(0, 300)}`);
+    console.error(`[bulk-sync] staged upload failed: ${uploadResponse.status} ${body.slice(0, 300)}`);
+    throw new Error(
+      `Could not upload the prepared tag changes to Shopify (HTTP ${uploadResponse.status}). Please run the sync again.`,
+    );
   }
 
   return target.parameters.find((param) => param.name === "key").value;

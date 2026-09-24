@@ -3,7 +3,12 @@
 // lets `node --test` load the real sync code unmodified while swapping those two
 // boundaries for in-memory doubles.
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+
+// esbuild ships with Vite, so it is already installed wherever the app builds.
+const require = createRequire(import.meta.url);
+let esbuild = null;
 
 const OVERRIDES = {
   "db.server": new URL("./fake-db.mjs", import.meta.url).href,
@@ -37,11 +42,17 @@ export async function resolve(specifier, context, nextResolve) {
 
 export async function load(url, context, nextLoad) {
   if (url.endsWith(".jsx")) {
-    return {
-      format: "module",
-      shortCircuit: true,
-      source: fs.readFileSync(fileURLToPath(url), "utf8"),
-    };
+    // Transformed, not passed through: the dashboard route holds real JSX, and
+    // its loader and action are what decide what a merchant sees.
+    esbuild ??= require("esbuild");
+    const filename = fileURLToPath(url);
+    const { code } = await esbuild.transform(fs.readFileSync(filename, "utf8"), {
+      loader: "jsx",
+      jsx: "automatic",
+      format: "esm",
+      sourcefile: filename,
+    });
+    return { format: "module", shortCircuit: true, source: code };
   }
   return nextLoad(url, context);
 }

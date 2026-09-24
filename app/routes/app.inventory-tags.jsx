@@ -5,6 +5,8 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
+  clipCollectionTitle,
+  fetchCollection,
   fetchCollections,
   getSettings,
   normalizeCollectionId,
@@ -13,15 +15,21 @@ import {
 } from "../services/inventory-tags.server";
 import {
   cancelBulkSync,
+  friendlyError,
   getBulkSyncJob,
   startBulkSync,
   tickBulkSync,
 } from "../services/bulk-sync.server";
 import {
+  bulkSyncFinishedAgoLabel,
   bulkSyncPollDelayMs,
+  bulkSyncSettingsDrift,
   bulkSyncView,
+  formatProductCount,
   isBulkSyncActive,
   isBulkSyncFinished,
+  isSameTag,
+  newerJob,
   syncScopeLabel,
 } from "../lib/bulk-sync-status";
 
@@ -97,28 +105,50 @@ function PlayIcon({ size = 14, className = "" }) {
   );
 }
 
+/** Identifies one run's outcome, whether its dates arrived as Dates or strings. */
+function outcomeKey(job) {
+  return `${new Date(job.startedAt).getTime()}:${job.status}`;
+}
+
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
   const job = await tickBulkSync(session.shop);
 
-  // The picker is a convenience; a store whose collection list cannot be read
-  // must still get a working dashboard, with the saved selection intact.
-  const collections = await fetchCollections(admin).catch((error) => {
-    console.error("Could not load collections:", error);
-    return null;
-  });
+  const [collections, liveCollection] = await Promise.all([
+    // The picker is a convenience; a store whose collection list cannot be read
+    // must still get a working dashboard, with the saved selection intact.
+    fetchCollections(admin).catch((error) => {
+      console.error("Could not load collections:", error);
+      return null;
+    }),
+    // undefined = could not check, null = Shopify says it no longer exists.
+    settings.collectionId
+      ? lookUpCollection(admin, settings.collectionId)
+      : Promise.resolve(undefined),
+  ]);
 
   return {
     tagName: settings.tagName,
     autoSyncEnabled: settings.autoSyncEnabled,
     collectionId: settings.collectionId,
-    collectionTitle: settings.collectionTitle,
+    // The live title when Shopify gave one, so a collection renamed since it
+    // was picked shows under its current name rather than the cached one.
+    collectionTitle: liveCollection?.title ?? settings.collectionTitle,
+    collectionMissing: liveCollection === null,
     collections: collections ?? [],
     collectionsUnavailable: collections === null,
     job,
   };
 };
+
+/** fetchCollection, with "could not ask" reported as undefined, never thrown. */
+function lookUpCollection(admin, collectionId) {
+  return fetchCollection(admin, collectionId).catch((error) => {
+    console.error("Could not look up the selected collection:", error);
+    return undefined;
+  });
+}
 
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
@@ -185,14 +215,39 @@ export const action = async ({ request }) => {
       // Read from the database rather than from the form, so the run always
       // uses the scope that is actually saved.
       const settings = await getSettings(session.shop);
+      let collectionTitle = settings.collectionTitle;
+
+      if (settings.collectionId) {
+        const live = await lookUpCollection(admin, settings.collectionId);
+        if (live === null) {
+          // Exporting a deleted collection returns nothing, so the run would
+          // end on "Sync complete — scanned 0 products": a false all-clear.
+          const name = collectionTitle ? `“${collectionTitle}” ` : "you selected ";
+          return {
+            intent,
+            error: `The collection ${name}no longer exists in Shopify. Choose another collection, or set the sync scope to the entire catalog, then save.`,
+          };
+        }
+        const liveTitle = live ? clipCollectionTitle(live.title) : null;
+        if (liveTitle && liveTitle !== collectionTitle) {
+          // Renamed in Shopify since it was picked: pin the current name onto
+          // this run's summary, and keep the stored copy current.
+          collectionTitle = liveTitle;
+          await setSettings(session.shop, {
+            collectionId: settings.collectionId,
+            collectionTitle,
+          }).catch((error) => console.error("Could not refresh the collection title:", error));
+        }
+      }
+
       const job = await startBulkSync(admin, session.shop, settings.tagName, {
         collectionId: settings.collectionId,
-        collectionTitle: settings.collectionTitle,
+        collectionTitle,
       });
       return { intent, job };
     } catch (error) {
       console.error("Failed to start bulk sync:", error);
-      return { intent, error: error.message };
+      return { intent, error: friendlyError(error) };
     }
   }
 
@@ -201,7 +256,7 @@ export const action = async ({ request }) => {
       return { intent, job: await tickBulkSync(session.shop) };
     } catch (error) {
       console.error("Failed to read bulk sync status:", error);
-      return { intent, error: error.message, job: await getBulkSyncJob(session.shop) };
+      return { intent, error: friendlyError(error), job: await getBulkSyncJob(session.shop) };
     }
   }
 
@@ -210,7 +265,7 @@ export const action = async ({ request }) => {
       return { intent, job: await cancelBulkSync(admin, session.shop) };
     } catch (error) {
       console.error("Failed to cancel bulk sync:", error);
-      return { intent, error: error.message };
+      return { intent, error: friendlyError(error) };
     }
   }
 
@@ -225,15 +280,23 @@ export default function InventoryTagsPage() {
     collectionTitle: initialCollectionTitle,
     collections,
     collectionsUnavailable,
+    collectionMissing,
     job: initialJob,
   } = useLoaderData();
 
   const settingsFetcher = useFetcher();
+  // Its own fetcher: sharing one with the settings form made flipping the
+  // switch relabel the form's button "Saving…" and lock it until it answered.
+  const toggleFetcher = useFetcher();
   const syncFetcher = useFetcher();
   const pollFetcher = useFetcher();
   const cancelFetcher = useFetcher();
   const shopify = useAppBridge();
-  const notifiedRef = useRef(null);
+  // Seeded with the outcome already on screen at load, so reopening the
+  // dashboard does not re-toast a sync that finished days ago.
+  const notifiedRef = useRef(
+    isBulkSyncFinished(initialJob) ? outcomeKey(initialJob) : null,
+  );
 
   const [tagName, setTagName] = useState(initialTagName);
   // What is actually stored, so the field can warn that renaming the tag leaves
@@ -283,18 +346,27 @@ export default function InventoryTagsPage() {
   });
 
   const isSaving = settingsFetcher.state !== "idle";
+  const isToggling = toggleFetcher.state !== "idle";
 
   const [job, setJob] = useState(initialJob || null);
   const active = isBulkSyncActive(job);
   const isStarting = syncFetcher.state !== "idle";
   const isCancelling = cancelFetcher.state !== "idle";
   const startError = syncFetcher.data?.error;
+  // Only while running: a poll that failed says nothing about a finished run.
+  const pollError = active ? pollFetcher.data?.error : null;
 
-  useEffect(() => {
-    for (const data of [syncFetcher.data, pollFetcher.data, cancelFetcher.data]) {
-      if (data?.job) setJob(data.job);
-    }
-  }, [syncFetcher.data, pollFetcher.data, cancelFetcher.data]);
+  // One effect per fetcher, so each answer is applied once, when it arrives.
+  // A single effect over all three re-applied every fetcher's last answer
+  // whenever any of them changed — so the previous run's final poll (or the
+  // last cancel) overwrote each newly started run, which then was never polled
+  // or shown. newerJob also drops an answer that arrives out of order.
+  const applyJob = useCallback((incoming) => {
+    if (incoming) setJob((current) => newerJob(current, incoming));
+  }, []);
+  useEffect(() => applyJob(syncFetcher.data?.job), [syncFetcher.data, applyJob]);
+  useEffect(() => applyJob(pollFetcher.data?.job), [pollFetcher.data, applyJob]);
+  useEffect(() => applyJob(cancelFetcher.data?.job), [cancelFetcher.data, applyJob]);
 
   const pollRef = useRef(pollFetcher);
   const jobRef = useRef(job);
@@ -322,57 +394,75 @@ export default function InventoryTagsPage() {
   }, [active]);
 
   useEffect(() => {
-    if (settingsFetcher.data?.tagName !== undefined) {
-      setTagName(settingsFetcher.data.tagName);
-      setSavedTagName(settingsFetcher.data.tagName);
-    }
-    if (settingsFetcher.data?.autoSyncEnabled !== undefined) {
-      setAutoSyncEnabled(settingsFetcher.data.autoSyncEnabled);
-    }
-    if (
-      settingsFetcher.data?.intent === "save-settings" &&
-      !settingsFetcher.data.error
-    ) {
-      const savedId = settingsFetcher.data.collectionId || "";
-      const savedTitle = settingsFetcher.data.collectionTitle || "";
-      setCollectionId(savedId);
-      setCollectionTitle(savedTitle);
-      setSavedCollectionId(savedId);
-      setSavedCollectionTitle(savedTitle);
+    const data = settingsFetcher.data;
+    if (data?.intent !== "save-settings") return;
+    if (data.error) {
+      shopify.toast.show(data.error, { isError: true });
+      return;
     }
 
-    if (settingsFetcher.data?.intent === "save-settings") {
-      if (settingsFetcher.data.error) {
-        shopify.toast.show(settingsFetcher.data.error, { isError: true });
-      } else {
-        shopify.toast.show("Settings saved");
-      }
-    } else if (settingsFetcher.data?.intent === "toggle-auto-sync") {
-      if (settingsFetcher.data.error) {
-        shopify.toast.show(settingsFetcher.data.error, { isError: true });
-      } else {
-        shopify.toast.show(
-          settingsFetcher.data.autoSyncEnabled
-            ? "Automatic inventory sync enabled"
-            : "Automatic inventory sync disabled",
-        );
-      }
-    }
+    setTagName(data.tagName);
+    setSavedTagName(data.tagName);
+    const savedId = data.collectionId || "";
+    const savedTitle = data.collectionTitle || "";
+    setCollectionId(savedId);
+    setCollectionTitle(savedTitle);
+    setSavedCollectionId(savedId);
+    setSavedCollectionTitle(savedTitle);
+    shopify.toast.show("Settings saved");
   }, [settingsFetcher.data, shopify]);
 
   useEffect(() => {
+    const data = toggleFetcher.data;
+    if (data?.intent !== "toggle-auto-sync") return;
+    // Present on failure too: the stored value, so the switch snaps back.
+    if (data.autoSyncEnabled !== undefined) setAutoSyncEnabled(data.autoSyncEnabled);
+    if (data.error) {
+      shopify.toast.show(data.error, { isError: true });
+    } else {
+      shopify.toast.show(
+        data.autoSyncEnabled
+          ? "Automatic inventory sync enabled"
+          : "Automatic inventory sync disabled",
+      );
+    }
+  }, [toggleFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (cancelFetcher.data?.error) {
+      shopify.toast.show(`Could not cancel the sync: ${cancelFetcher.data.error}`, {
+        isError: true,
+      });
+    }
+  }, [cancelFetcher.data, shopify]);
+
+  // Rendered only after mount: "3 minutes ago" computed during the server
+  // render would disagree with the client's clock and break hydration.
+  const [now, setNow] = useState(null);
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     if (!isBulkSyncFinished(job)) return;
-    const key = `${job.startedAt}:${job.status}`;
+    const key = outcomeKey(job);
     if (notifiedRef.current === key) return;
     notifiedRef.current = key;
 
     shopify.toast.show(
       job.status === "completed"
-        ? "Catalog sync complete"
+        ? job.failed > 0
+          ? "Catalog sync finished with errors"
+          : "Catalog sync complete"
         : job.status === "cancelled"
           ? "Catalog sync cancelled"
           : `Sync failed: ${job.errorMessage || "unknown error"}`,
-      { isError: job.status === "failed", duration: job.status === "failed" ? 8000 : 4000 },
+      {
+        isError: job.status === "failed",
+        duration: job.status === "failed" || job.failed > 0 ? 8000 : 4000,
+      },
     );
   }, [job, shopify]);
 
@@ -383,7 +473,7 @@ export default function InventoryTagsPage() {
   const handleToggleAutoSync = (enabled) => {
     if (enabled === autoSyncEnabled) return;
     setAutoSyncEnabled(enabled);
-    settingsFetcher.submit(
+    toggleFetcher.submit(
       {
         intent: "toggle-auto-sync",
         autoSyncEnabled: String(enabled),
@@ -393,7 +483,21 @@ export default function InventoryTagsPage() {
   };
 
   const view = bulkSyncView({ job, isStarting, startError });
-  const { percent, progress, elapsed, statusText, stats } = view;
+  const { percent, progress, elapsed, statusText, stats, notes } = view;
+  // Job-derived context, only beside a banner that is about that job.
+  const showsJobOutcome = view.mode === "finished" && !view.startFailed;
+  const finishedAgo = showsJobOutcome && now ? bulkSyncFinishedAgoLabel(job, now) : null;
+  const settingsDrift = showsJobOutcome
+    ? bulkSyncSettingsDrift(job, {
+        tagName: savedTagName,
+        collectionId: savedCollectionId || null,
+      })
+    : null;
+
+  const tagRenamePending = Boolean(tagName.trim()) && !isSameTag(tagName, savedTagName);
+  const savedCollectionName = savedCollectionTitle
+    ? `“${savedCollectionTitle}”`
+    : "the selected collection";
 
   return (
     <s-page heading="Dashboard">
@@ -720,6 +824,21 @@ export default function InventoryTagsPage() {
           font-size: 12.5px;
           line-height: 1.5;
           color: #78350f;
+        }
+
+        .scope-error {
+          background: #fef2f2;
+          border: 1px solid #fecaca;
+          border-radius: 8px;
+          padding: 10px 14px;
+          font-size: 12.5px;
+          line-height: 1.5;
+          color: #991b1b;
+        }
+
+        .progress-note {
+          font-size: 12.5px;
+          color: #92400e;
         }
 
         .tag-preview-group {
@@ -1049,7 +1168,7 @@ export default function InventoryTagsPage() {
                   aria-label="Automatic inventory sync"
                   onClick={() => handleToggleAutoSync(!autoSyncEnabled)}
                   className="switch-toggle-btn"
-                  disabled={isSaving}
+                  disabled={isToggling}
                   title={autoSyncEnabled ? "Click to disable auto sync" : "Click to enable auto sync"}
                 >
                   <span className="switch-label-text">
@@ -1084,14 +1203,16 @@ export default function InventoryTagsPage() {
                 </div>
               </div>
 
+              {/* The tag in force, not the field's draft: until it is saved,
+                  both syncs keep writing the saved one. */}
               <div className="tag-preview-group">
-                <span>Active tag badge:</span>
+                <span>Active tag:</span>
                 <span className="tag-chip">
-                  <TagIcon size={12} /> {tagName || "out-of-stock-hidden"}
+                  <TagIcon size={12} /> {savedTagName}
                 </span>
               </div>
 
-              {tagName.trim() && tagName.trim() !== savedTagName && (
+              {tagRenamePending && (
                 <div className="tag-rename-note">
                   Renaming only changes what this app writes from now on. Products already
                   carrying <code className="tag-chip">{savedTagName}</code> keep it — remove
@@ -1120,6 +1241,9 @@ export default function InventoryTagsPage() {
                 {collectionOptions.map((collection) => (
                   <option key={collection.id} value={collection.id}>
                     {collection.title}
+                    {collectionMissing && collection.id === savedCollectionId
+                      ? " (no longer exists)"
+                      : ""}
                   </option>
                 ))}
               </select>
@@ -1146,6 +1270,14 @@ export default function InventoryTagsPage() {
                 )}
               </div>
 
+              {collectionMissing && savedCollectionId && (
+                <div className="scope-error" role="alert">
+                  The collection {savedCollectionName} no longer exists in Shopify,
+                  so Automatic Sync and Manual Sync are skipping every product.
+                  Choose another collection or the entire catalog, then save.
+                </div>
+              )}
+
               {collectionsUnavailable && (
                 <div className="scope-warning">
                   Could not load your collections right now, so the list may be
@@ -1153,11 +1285,26 @@ export default function InventoryTagsPage() {
                 </div>
               )}
 
+              {/* A scoped sync never touches products outside its scope, so
+                  "run a sync" only helps when the new scope covers the old. */}
               {scopeDirty && (
                 <div className="scope-warning">
-                  Scope change not saved yet. Products already tagged under the
-                  previous scope keep their tag &mdash; run a sync after saving to
-                  bring the new scope in line.
+                  {collectionId ? (
+                    <>
+                      Scope change not saved yet. Once saved, products outside
+                      &ldquo;{collectionTitle || "this collection"}&rdquo; are left exactly as
+                      they are &mdash; any that already carry{" "}
+                      <code className="tag-chip">{savedTagName}</code> keep it, even
+                      after they are restocked. Remove it from those in bulk in
+                      Shopify admin if needed, and run a sync after saving to update
+                      the products in the new collection.
+                    </>
+                  ) : (
+                    <>
+                      Scope change not saved yet. Run a sync after saving to apply
+                      the rules across your entire catalog.
+                    </>
+                  )}
                 </div>
               )}
 
@@ -1189,7 +1336,7 @@ export default function InventoryTagsPage() {
                     <span className="rule-condition">Inventory &lt; 1</span>
                     <span className="rule-arrow">&rarr;</span>
                     <span className="rule-action-text">
-                      Add tag <code className="tag-chip">{tagName || "out-of-stock-hidden"}</code>
+                      Add tag <code className="tag-chip">{savedTagName}</code>
                     </span>
                   </div>
                 </div>
@@ -1206,7 +1353,7 @@ export default function InventoryTagsPage() {
                     <span className="rule-condition">Inventory &gt; 0</span>
                     <span className="rule-arrow">&rarr;</span>
                     <span className="rule-action-text">
-                      Remove tag <code className="tag-chip">{tagName || "out-of-stock-hidden"}</code>
+                      Remove tag <code className="tag-chip">{savedTagName}</code>
                     </span>
                   </div>
                 </div>
@@ -1219,7 +1366,7 @@ export default function InventoryTagsPage() {
                   modified. Products that don&rsquo;t track inventory are never tagged &mdash; and
                   the tag is removed if they already carry it.
                   {savedCollectionId
-                    ? ` Both rules apply only to products in ${savedCollectionTitle || "the selected collection"}.`
+                    ? ` Both rules apply only to products in ${savedCollectionName}.`
                     : ""}
                 </span>
               </div>
@@ -1236,7 +1383,7 @@ export default function InventoryTagsPage() {
               </h2>
               <p className="dash-subtitle">
                 {savedCollectionId
-                  ? "Scans the active products in the selected collection in the background and applies or removes tags to match current inventory."
+                  ? `Scans the active products in ${savedCollectionName} in the background and applies or removes tags to match current inventory.`
                   : "Scans your entire active product catalog in the background and applies or removes tags to match current inventory."}
               </p>
             </div>
@@ -1275,7 +1422,9 @@ export default function InventoryTagsPage() {
 
             {/* Sync Progress or Outcome Box */}
             {view.mode !== "idle" && (
-              <div className="progress-box">
+              // Announces each phase change to screen readers without
+              // interrupting; the visible text is the same either way.
+              <div className="progress-box" aria-live="polite">
                 {view.mode === "running" ? (
                   <>
                     <div className="progress-meta">
@@ -1283,7 +1432,7 @@ export default function InventoryTagsPage() {
                       <span>
                         {percent !== null
                           ? `${percent}%`
-                          : `${(progress?.current ?? 0).toLocaleString()} products`}
+                          : formatProductCount(progress?.current ?? 0)}
                         {elapsed ? ` · ${elapsed}` : ""}
                       </span>
                     </div>
@@ -1301,20 +1450,29 @@ export default function InventoryTagsPage() {
                         style={percent === null ? undefined : { width: `${percent}%` }}
                       />
                     </div>
+
+                    {pollError && (
+                      <span className="progress-note">
+                        Having trouble checking on the sync &mdash; still retrying. The
+                        sync itself keeps running in the background.
+                      </span>
+                    )}
                   </>
                 ) : (
                   <>
                     <s-banner tone={view.tone} heading={view.heading}>
                       <s-paragraph>{statusText}</s-paragraph>
-                      {job?.tagged === 0 && job?.untagged === 0 && (job?.processed || 0) > 0 && (
-                        <s-paragraph color="subdued">
-                          All products are already up to date with your automation rules (no tags needed to be added or removed).
+                      {notes.map((note) => (
+                        <s-paragraph key={note} color="subdued">
+                          {note}
                         </s-paragraph>
-                      )}
-                      {elapsed && (
-                        <s-paragraph color="subdued">Took {elapsed}.</s-paragraph>
+                      ))}
+                      {finishedAgo && (
+                        <s-paragraph color="subdued">Last run ended {finishedAgo}.</s-paragraph>
                       )}
                     </s-banner>
+
+                    {settingsDrift && <div className="scope-warning">{settingsDrift}</div>}
 
                     {stats.length > 0 && (
                       <div className="sync-stats-bar">
@@ -1352,10 +1510,18 @@ export function ErrorBoundary() {
   return boundary.error(useRouteError());
 }
 
+// Actions whose result the page already applies itself. Re-running the loader
+// after them refetches up to 1,250 collections from Shopify for nothing — on
+// the status poll that would be every 2 seconds.
+const SELF_APPLIED_INTENTS = new Set(["check-sync", "cancel-sync", "toggle-auto-sync"]);
+
 export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
-  // Polling checks the sync status every 2 seconds. Re-running the route loader
-  // on every check would wastefully refetch collections and settings from Shopify.
-  if (actionResult?.intent === "check-sync") {
+  if (SELF_APPLIED_INTENTS.has(actionResult?.intent)) {
+    return false;
+  }
+  // A refused start (a deleted collection, say) is worth a reload: the loader
+  // is what tells the settings card about it.
+  if (actionResult?.intent === "run-sync" && !actionResult.error) {
     return false;
   }
   return defaultShouldRevalidate;
