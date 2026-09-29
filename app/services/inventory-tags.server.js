@@ -3,6 +3,7 @@ import { graphqlWithRetry } from "./shopify-retry.server";
 
 export const DEFAULT_TAG_NAME = "out-of-stock-hidden";
 export const DEFAULT_AUTO_SYNC = false;
+export const DEFAULT_STATUS_RULES = false;
 /** Shopify rejects a tag longer than this. */
 export const MAX_TAG_LENGTH = 255;
 
@@ -108,7 +109,17 @@ export async function getSettings(shop) {
     // rather than as a collection whose id is "".
     collectionId: setting?.collectionId || null,
     collectionTitle: (setting?.collectionId && setting?.collectionTitle) || null,
+    statusRulesEnabled: setting?.statusRulesEnabled ?? DEFAULT_STATUS_RULES,
   };
+}
+
+/**
+ * Whether the status rules actually apply. They are collection-based: with the
+ * whole catalog in scope they stay off even when the checkbox is ticked, so a
+ * merchant can never unlist every sold-out product in the store by accident.
+ */
+export function statusRulesActive({ statusRulesEnabled, collectionId } = {}) {
+  return Boolean(statusRulesEnabled && collectionId);
 }
 
 const COLLECTIONS_PAGE = `#graphql
@@ -182,7 +193,7 @@ export async function getTagName(shop) {
 
 export async function setSettings(
   shop,
-  { tagName, autoSyncEnabled, collectionId, collectionTitle },
+  { tagName, autoSyncEnabled, collectionId, collectionTitle, statusRulesEnabled },
 ) {
   if (tagName !== undefined) {
     const validated = normalizeTagName(tagName);
@@ -212,18 +223,24 @@ export async function setSettings(
     autoSyncEnabled !== undefined
       ? autoSyncEnabled
       : (existing?.autoSyncEnabled ?? DEFAULT_AUTO_SYNC);
+  const finalStatusRules =
+    statusRulesEnabled !== undefined
+      ? statusRulesEnabled
+      : (existing?.statusRulesEnabled ?? DEFAULT_STATUS_RULES);
 
   return db.tagAutomationSetting.upsert({
     where: { shop },
     update: {
       ...(tagName !== undefined ? { tagName } : {}),
       ...(autoSyncEnabled !== undefined ? { autoSyncEnabled } : {}),
+      ...(statusRulesEnabled !== undefined ? { statusRulesEnabled } : {}),
       ...(scope ?? {}),
     },
     create: {
       shop,
       tagName: finalTagName,
       autoSyncEnabled: finalAutoSync,
+      statusRulesEnabled: finalStatusRules,
       collectionId: scope?.collectionId ?? existing?.collectionId ?? null,
       collectionTitle: scope?.collectionTitle ?? existing?.collectionTitle ?? null,
     },
@@ -285,6 +302,10 @@ function toQuantity(value) {
  * including a tag it already carries, which this app may well have put there
  * under a previous scope. Stripping those would make changing the selection a
  * destructive act on products the merchant did not ask about.
+ *
+ * `manageUnlisted` is set while the status rules are in force. A product those
+ * rules unlisted is still this app's to look after — without it, a restocked
+ * product would get its status back but keep the out-of-stock tag forever.
  */
 export function resolveTagAction({
   status,
@@ -294,8 +315,9 @@ export function resolveTagAction({
   tagName,
   collectionScoped = false,
   inCollection = false,
+  manageUnlisted = false,
 }) {
-  if (status !== "ACTIVE") {
+  if (status !== "ACTIVE" && !(manageUnlisted && status === "UNLISTED")) {
     return null;
   }
 
@@ -327,6 +349,72 @@ export function resolveTagAction({
   }
 
   return hasTag ? "remove" : null;
+}
+
+/**
+ * The status rules' counterpart to resolveTagAction: "UNLISTED" for a product
+ * that is out of stock, "ACTIVE" for one that is back in stock, or null to
+ * leave it alone.
+ *
+ * `enabled` is statusRulesActive() — the checkbox is on and a collection is
+ * selected — and the rules only reach products inside that collection. Draft
+ * and archived products are never touched, and neither is a product that does
+ * not track inventory: its quantity says nothing about whether it can be sold.
+ * Negative stock (oversold) counts as out of stock, just like zero.
+ */
+export function resolveStatusAction({
+  status,
+  quantity,
+  tracked,
+  enabled = false,
+  inCollection = false,
+}) {
+  if (!enabled || inCollection !== true) {
+    return null;
+  }
+
+  if (status !== "ACTIVE" && status !== "UNLISTED") {
+    return null;
+  }
+
+  if (!tracked) {
+    return null;
+  }
+
+  const amount = toQuantity(quantity);
+  if (amount === null) {
+    return null;
+  }
+
+  if (amount <= 0) {
+    return status === "UNLISTED" ? null : "UNLISTED";
+  }
+
+  return status === "ACTIVE" ? null : "ACTIVE";
+}
+
+export async function applyStatusAction(admin, productId, status, options = {}) {
+  // Same retry wrapper as the tag mutations, for the same reason: a throttle
+  // arrives as HTTP 200 with no `data`, which must not read as success.
+  const data = await graphqlWithRetry(
+    admin,
+    `#graphql
+      mutation setProductStatus($product: ProductUpdateInput!) {
+        productUpdate(product: $product) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }`,
+    {
+      variables: { product: { id: productId, status } },
+      label: "productUpdate",
+      ...(options.attempts ? { attempts: options.attempts } : {}),
+    },
+  );
+
+  return data?.productUpdate?.userErrors || [];
 }
 
 export async function applyTagAction(

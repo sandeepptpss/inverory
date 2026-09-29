@@ -66,6 +66,9 @@ export class ShopifySimulator {
     // Number of leading GraphQL calls that answer with a THROTTLED error.
     this.throttleCount = options.throttleCount ?? 0;
     this.hangQuery = options.hangQuery ?? false;
+    // Bulk mutations for this result field (e.g. "productUpdate") never finish,
+    // so a test can act while one is in flight.
+    this.hangMutationField = options.hangMutationField ?? null;
     // Keep the query operation in CREATED (queued at Shopify, never started).
     this.queueQueryForever = options.queueQueryForever ?? false;
     // Which synthetic catalog the export serves: a name from CATALOGS, or a
@@ -91,6 +94,10 @@ export class ShopifySimulator {
     this.calls = [];
     this.operations = new Map();
     this.uploads = new Map();
+    /** Full body of each small staged upload, so tests can read its rows. */
+    this.uploadBodies = new Map();
+    /** Every bulk mutation started: `{ field, rows }`, in order. */
+    this.bulkMutations = [];
     this.current = { QUERY: null, MUTATION: null };
     this.nextId = 1;
     this.server = null;
@@ -197,7 +204,12 @@ export class ShopifySimulator {
           });
         }
         const rows = this.uploads.get(variables.stagedUploadPath) ?? 0;
-        const field = /tagsAdd/.test(variables.mutation) ? "tagsAdd" : "tagsRemove";
+        const field = /tagsAdd/.test(variables.mutation)
+          ? "tagsAdd"
+          : /productUpdate/.test(variables.mutation)
+            ? "productUpdate"
+            : "tagsRemove";
+        this.bulkMutations.push({ field, rows, stagedUploadPath: variables.stagedUploadPath });
         return json({
           data: {
             bulkOperationRunMutation: this.#createOperation("MUTATION", { rows, field }),
@@ -251,6 +263,12 @@ export class ShopifySimulator {
       return publicView(op);
     }
 
+    if (op.type === "MUTATION" && op.field === this.hangMutationField) {
+      op.status = "RUNNING";
+      op.objectCount = "0";
+      return publicView(op);
+    }
+
     if (op.polls <= limit) {
       op.status = "RUNNING";
       // Report partial progress so the test can assert the count climbs.
@@ -284,6 +302,10 @@ export class ShopifySimulator {
       let key = null;
       let buffer = "";
       let carry = "";
+      // Every row — a tag row or a productUpdate row — carries exactly one id.
+      const ROW_MARKER = /"id":/g;
+      const CARRY = '"id":'.length - 1;
+      let body = "";
       req.on("data", (chunk) => {
         bytes += chunk.length;
         const text = chunk.toString("utf8");
@@ -295,13 +317,20 @@ export class ShopifySimulator {
         if (buffer.length > 4096) buffer = buffer.slice(-2048);
 
         // Count rows across chunk boundaries: a naive per-chunk match loses any
-        // marker split between two chunks.
+        // marker split between two chunks. The carry is one character shorter
+        // than the marker, so a marker can never be counted twice.
         const window = carry + text;
-        lines += (window.match(/"tags"/g) || []).length;
-        carry = window.slice(-5);
+        lines += (window.match(ROW_MARKER) || []).length;
+        carry = window.slice(-CARRY);
+
+        if (body !== null) {
+          body += text;
+          if (body.length > 1_000_000) body = null;
+        }
       });
       await once(req, "end");
       this.uploads.set(key, lines);
+      if (body !== null) this.uploadBodies.set(key, body);
       this.lastUploadBytes = bytes;
       this.uploadBytes = (this.uploadBytes ?? new Map()).set(key, bytes);
       res.writeHead(204).end();

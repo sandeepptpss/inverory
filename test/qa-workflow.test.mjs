@@ -223,6 +223,7 @@ describe("tag settings", () => {
       autoSyncEnabled: false,
       collectionId: null,
       collectionTitle: null,
+      statusRulesEnabled: false,
     });
 
     await tags.setSettings(shop, { tagName: "backorder" });
@@ -231,6 +232,7 @@ describe("tag settings", () => {
       autoSyncEnabled: false,
       collectionId: null,
       collectionTitle: null,
+      statusRulesEnabled: false,
     });
   });
 
@@ -246,12 +248,14 @@ describe("tag settings", () => {
       autoSyncEnabled: true,
       collectionId: null,
       collectionTitle: null,
+      statusRulesEnabled: false,
     });
     assert.deepEqual(await tags.getSettings(b), {
       tagName: "b-tag",
       autoSyncEnabled: false,
       collectionId: null,
       collectionTitle: null,
+      statusRulesEnabled: false,
     });
   });
 

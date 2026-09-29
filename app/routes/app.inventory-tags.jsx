@@ -139,6 +139,7 @@ export const loader = async ({ request }) => {
   return {
     tagName: settings.tagName,
     autoSyncEnabled: settings.autoSyncEnabled,
+    statusRulesEnabled: settings.statusRulesEnabled,
     collectionId: settings.collectionId,
     // The live title when Shopify gave one, so a collection renamed since it
     // was picked shows under its current name rather than the cached one.
@@ -218,6 +219,27 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (intent === "toggle-status-rules") {
+    const statusRulesEnabled = formData.get("statusRulesEnabled") === "true";
+    try {
+      // Stores the setting and nothing else. No product changes status until a
+      // sync actually runs — an Auto Sync webhook or "Run sync now".
+      await setSettings(session.shop, { statusRulesEnabled });
+      return { intent, statusRulesEnabled };
+    } catch (error) {
+      console.error("Failed to update the status rules:", error);
+      // Hand back what is actually stored so the checkbox snaps back.
+      const current = await getSettings(session.shop).catch(() => ({
+        statusRulesEnabled: !statusRulesEnabled,
+      }));
+      return {
+        intent,
+        error: "Could not update the status rules. Please try again.",
+        statusRulesEnabled: current.statusRulesEnabled,
+      };
+    }
+  }
+
   if (intent === "run-sync") {
     try {
       // Read from the database rather than from the form, so the run always
@@ -251,6 +273,7 @@ export const action = async ({ request }) => {
       const job = await startBulkSync(admin, session.shop, settings.tagName, {
         collectionId: settings.collectionId,
         collectionTitle,
+        statusRulesEnabled: settings.statusRulesEnabled,
       });
       return { intent, job };
     } catch (error) {
@@ -284,6 +307,7 @@ export default function InventoryTagsPage() {
   const {
     tagName: initialTagName,
     autoSyncEnabled: initialAutoSync,
+    statusRulesEnabled: initialStatusRules,
     collectionId: initialCollectionId,
     collectionTitle: initialCollectionTitle,
     collections,
@@ -296,6 +320,8 @@ export default function InventoryTagsPage() {
   // Its own fetcher: sharing one with the settings form made flipping the
   // switch relabel the form's button "Saving…" and lock it until it answered.
   const toggleFetcher = useFetcher();
+  // Likewise its own, so the checkbox and the switch never lock each other.
+  const statusFetcher = useFetcher();
   const syncFetcher = useFetcher();
   const pollFetcher = useFetcher();
   const cancelFetcher = useFetcher();
@@ -311,6 +337,9 @@ export default function InventoryTagsPage() {
   // the old one behind on every product that already carries it.
   const [savedTagName, setSavedTagName] = useState(initialTagName);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(initialAutoSync);
+  const [statusRulesEnabled, setStatusRulesEnabled] = useState(
+    Boolean(initialStatusRules),
+  );
 
   const [collectionId, setCollectionId] = useState(initialCollectionId || "");
   const [collectionTitle, setCollectionTitle] = useState(
@@ -388,6 +417,10 @@ export default function InventoryTagsPage() {
 
   const isSaving = settingsFetcher.state !== "idle";
   const isToggling = toggleFetcher.state !== "idle";
+  const isTogglingStatus = statusFetcher.state !== "idle";
+  // The rules are collection-based: ticked with the whole catalog in scope,
+  // they are saved but do nothing until a collection is saved too.
+  const statusRulesInForce = statusRulesEnabled && Boolean(savedCollectionId);
 
   const [job, setJob] = useState(initialJob || null);
   const active = isBulkSyncActive(job);
@@ -470,6 +503,22 @@ export default function InventoryTagsPage() {
   }, [toggleFetcher.data, shopify]);
 
   useEffect(() => {
+    const data = statusFetcher.data;
+    if (data?.intent !== "toggle-status-rules") return;
+    // Present on failure too: the stored value, so the checkbox snaps back.
+    if (data.statusRulesEnabled !== undefined) setStatusRulesEnabled(data.statusRulesEnabled);
+    if (data.error) {
+      shopify.toast.show(data.error, { isError: true });
+    } else {
+      shopify.toast.show(
+        data.statusRulesEnabled
+          ? "Automatic status rules enabled"
+          : "Automatic status rules disabled",
+      );
+    }
+  }, [statusFetcher.data, shopify]);
+
+  useEffect(() => {
     if (cancelFetcher.data?.error) {
       shopify.toast.show(`Could not cancel the sync: ${cancelFetcher.data.error}`, {
         isError: true,
@@ -523,6 +572,18 @@ export default function InventoryTagsPage() {
     );
   };
 
+  const handleToggleStatusRules = (enabled) => {
+    if (enabled === statusRulesEnabled) return;
+    setStatusRulesEnabled(enabled);
+    statusFetcher.submit(
+      {
+        intent: "toggle-status-rules",
+        statusRulesEnabled: String(enabled),
+      },
+      { method: "POST" },
+    );
+  };
+
   const view = bulkSyncView({ job, isStarting, startError });
   const { percent, progress, elapsed, statusText, stats, notes } = view;
   // Job-derived context, only beside a banner that is about that job.
@@ -532,6 +593,7 @@ export default function InventoryTagsPage() {
     ? bulkSyncSettingsDrift(job, {
         tagName: savedTagName,
         collectionId: savedCollectionId || null,
+        statusRulesEnabled,
       })
     : null;
 
@@ -1057,6 +1119,81 @@ export default function InventoryTagsPage() {
           gap: 6px;
         }
 
+        .status-rules-box {
+          background: #ffffff;
+          border: 1px solid #e1e3e5;
+          border-radius: 10px;
+          padding: 14px 16px;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+
+        .status-rules-toggle {
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+        }
+
+        .status-rules-checkbox {
+          width: 16px;
+          height: 16px;
+          margin: 2px 0 0;
+          flex-shrink: 0;
+          accent-color: #008060;
+          cursor: pointer;
+        }
+        .status-rules-checkbox:disabled {
+          cursor: progress;
+        }
+        .status-rules-checkbox:focus-visible {
+          outline: 2px solid #008060;
+          outline-offset: 2px;
+        }
+
+        .status-rules-text {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+
+        .status-rules-title {
+          font-size: 13.5px;
+          font-weight: 600;
+          color: #202223;
+          cursor: pointer;
+        }
+
+        .status-rules-desc {
+          font-size: 12.5px;
+          color: #6d7175;
+          line-height: 1.5;
+        }
+
+        .rules-grid.is-inactive {
+          opacity: 0.6;
+        }
+
+        .status-chip {
+          display: inline-flex;
+          align-items: center;
+          padding: 3px 10px;
+          border-radius: 6px;
+          font-size: 12px;
+          font-weight: 600;
+          border: 1px solid transparent;
+        }
+        .status-chip-unlisted {
+          background: #fff7ed;
+          color: #9a3412;
+          border-color: #fed7aa;
+        }
+        .status-chip-active {
+          background: #f0fdf4;
+          color: #166534;
+          border-color: #bbf7d0;
+        }
+
         .rules-guardrail {
           background: #f6f6f7;
           border-radius: 8px;
@@ -1482,14 +1619,92 @@ export default function InventoryTagsPage() {
                 </div>
               </div>
 
+              {/* Status rules: opt-in and collection-based. Ticking the box only
+                  stores the setting; statuses change when a sync runs. */}
+              <div className="status-rules-box">
+                <div className="status-rules-toggle">
+                  <input
+                    id="statusRulesEnabled"
+                    type="checkbox"
+                    className="status-rules-checkbox"
+                    checked={statusRulesEnabled}
+                    onChange={(e) => handleToggleStatusRules(e.target.checked)}
+                    disabled={isTogglingStatus}
+                    aria-describedby="statusRulesDescription"
+                  />
+                  <div className="status-rules-text">
+                    <label htmlFor="statusRulesEnabled" className="status-rules-title">
+                      Enable Automatic Status Rules
+                    </label>
+                    <span id="statusRulesDescription" className="status-rules-desc">
+                      Sets products in the selected collection to Unlisted when they sell
+                      out and back to Active when restocked. Applied by Automatic Sync as
+                      inventory changes, and by Run sync now for existing products.
+                      Ticking this box changes nothing by itself; unticking it leaves
+                      product statuses as they are.
+                    </span>
+                  </div>
+                </div>
+
+                {statusRulesEnabled && !savedCollectionId && (
+                  <div className="scope-warning">
+                    Status rules only apply to products in a selected collection. Choose
+                    one under Sync scope and save to turn them on.
+                  </div>
+                )}
+
+                {statusRulesEnabled && (
+                  <div className={`rules-grid${statusRulesInForce ? "" : " is-inactive"}`}>
+                    {/* Rule 3 */}
+                    <div className="rule-card">
+                      <div className="rule-card-top">
+                        <span className="rule-pill-add">Rule 3 · Out of stock</span>
+                        <span style={{ color: "#991b1b", display: "inline-flex" }}>
+                          <MinusCircleIcon size={18} />
+                        </span>
+                      </div>
+                      <div className="rule-card-desc">
+                        <span className="rule-condition">Inventory &le; 0</span>
+                        <span className="rule-arrow">&rarr;</span>
+                        <span className="rule-action-text">
+                          Set status{" "}
+                          <span className="status-chip status-chip-unlisted">Unlisted</span>
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Rule 4 */}
+                    <div className="rule-card">
+                      <div className="rule-card-top">
+                        <span className="rule-pill-remove">Rule 4 · Restocked</span>
+                        <span style={{ color: "#166534", display: "inline-flex" }}>
+                          <PlusCircleIcon size={18} />
+                        </span>
+                      </div>
+                      <div className="rule-card-desc">
+                        <span className="rule-condition">Inventory &gt; 0</span>
+                        <span className="rule-arrow">&rarr;</span>
+                        <span className="rule-action-text">
+                          Set status{" "}
+                          <span className="status-chip status-chip-active">Active</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div className="rules-guardrail">
                 <span className="guardrail-icon"><ShieldCheckIcon size={18} /></span>
                 <span>
                   <strong>Safety guardrail:</strong> Draft and archived products are never
                   modified. Products that don&rsquo;t track inventory are never tagged &mdash; and
                   the tag is removed if they already carry it.
+                  {statusRulesInForce ? " Their status is never changed either." : ""}
                   {savedCollectionId
-                    ? ` Both rules apply only to products in ${savedCollectionName}.`
+                    ? statusRulesInForce
+                      ? ` All four rules apply only to products in ${savedCollectionName}.`
+                      : ` Both rules apply only to products in ${savedCollectionName}.`
                     : ""}
                 </span>
               </div>
@@ -1505,9 +1720,11 @@ export default function InventoryTagsPage() {
                 <span className="header-icon"><RefreshIcon size={20} /></span> Manual Full Catalog Sync
               </h2>
               <p className="dash-subtitle">
-                {savedCollectionId
-                  ? `Scans the active products in ${savedCollectionName} in the background and applies or removes tags to match current inventory.`
-                  : "Scans your entire active product catalog in the background and applies or removes tags to match current inventory."}
+                {statusRulesInForce
+                  ? `Scans the active and unlisted products in ${savedCollectionName} in the background and updates their tags and status to match current inventory.`
+                  : savedCollectionId
+                    ? `Scans the active products in ${savedCollectionName} in the background and applies or removes tags to match current inventory.`
+                    : "Scans your entire active product catalog in the background and applies or removes tags to match current inventory."}
               </p>
             </div>
             <span className="scope-chip">{savedScopeLabel}</span>
@@ -1636,7 +1853,12 @@ export function ErrorBoundary() {
 // Actions whose result the page already applies itself. Re-running the loader
 // after them refetches up to 1,250 collections from Shopify for nothing — on
 // the status poll that would be every 2 seconds.
-const SELF_APPLIED_INTENTS = new Set(["check-sync", "cancel-sync", "toggle-auto-sync"]);
+const SELF_APPLIED_INTENTS = new Set([
+  "check-sync",
+  "cancel-sync",
+  "toggle-auto-sync",
+  "toggle-status-rules",
+]);
 
 export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
   if (SELF_APPLIED_INTENTS.has(actionResult?.intent)) {

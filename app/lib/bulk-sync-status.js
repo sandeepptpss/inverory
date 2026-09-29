@@ -7,6 +7,9 @@ export const SYNC_STATUS = {
   downloading: "downloading",
   tagging: "tagging",
   untagging: "untagging",
+  // Status rules only: out-of-stock products -> UNLISTED, restocked -> ACTIVE.
+  unlisting: "unlisting",
+  activating: "activating",
   completed: "completed",
   failed: "failed",
   cancelled: "cancelled",
@@ -17,6 +20,8 @@ export const ACTIVE_STATUSES = [
   SYNC_STATUS.downloading,
   SYNC_STATUS.tagging,
   SYNC_STATUS.untagging,
+  SYNC_STATUS.unlisting,
+  SYNC_STATUS.activating,
 ];
 
 const ACTIVE_SET = new Set(ACTIVE_STATUSES);
@@ -56,9 +61,29 @@ export function isSameTag(a, b) {
   return canonicalTag(a) === canonicalTag(b);
 }
 
-/** Whether a sync pushed any tag change to Shopify before it stopped. */
+/** Whether a sync pushed any status change to Shopify before it stopped. */
+function statusMutationStarted(job) {
+  return Boolean(
+    job?.unlistMutationBulkOperationId || job?.activateMutationBulkOperationId,
+  );
+}
+
+/** Whether a sync pushed any tag or status change to Shopify before it stopped. */
 function mutationStarted(job) {
-  return Boolean(job?.addMutationBulkOperationId || job?.removeMutationBulkOperationId);
+  return Boolean(
+    job?.addMutationBulkOperationId ||
+      job?.removeMutationBulkOperationId ||
+      statusMutationStarted(job),
+  );
+}
+
+/**
+ * The product kinds a run scanned. With the status rules in force the export
+ * also covers unlisted products, and the messages say so; otherwise they read
+ * exactly as they did before the rules existed.
+ */
+function scannedKinds(job) {
+  return job?.statusRulesEnabled ? "active or unlisted products" : "active products";
 }
 
 /**
@@ -102,6 +127,16 @@ export function bulkSyncProgress(job) {
         current: Number(job.mutationProcessed || 0),
         total: Number(job.toUntag || 0),
       };
+    case SYNC_STATUS.unlisting:
+      return {
+        current: Number(job.mutationProcessed || 0),
+        total: Number(job.toUnlist || 0),
+      };
+    case SYNC_STATUS.activating:
+      return {
+        current: Number(job.mutationProcessed || 0),
+        total: Number(job.toActivate || 0),
+      };
     default:
       return null;
   }
@@ -133,13 +168,22 @@ export function bulkSyncStatusLabel(job) {
     case SYNC_STATUS.untagging:
       return `Removing the tag — ${count(job.mutationProcessed)} of ${formatProductCount(job.toUntag)}…`;
 
+    case SYNC_STATUS.unlisting:
+      return `Setting products to Unlisted — ${count(job.mutationProcessed)} of ${formatProductCount(job.toUnlist)}…`;
+
+    case SYNC_STATUS.activating:
+      return `Setting products to Active — ${count(job.mutationProcessed)} of ${formatProductCount(job.toActivate)}…`;
+
     case SYNC_STATUS.completed: {
       // A run whose tag updates Shopify rejected is not a clean success, and
       // the sentence must not open by claiming one.
       const hasFailures = job.failed > 0;
       const opening = hasFailures ? "Sync finished with errors" : "Sync complete";
       const failed = hasFailures ? `, ${count(job.failed)} failed` : "";
-      return `${opening} — scanned ${formatProductCount(job.processed)}${scopeSuffix(job)}, tagged ${count(job.tagged)}, untagged ${count(job.untagged)}${failed}.`;
+      const statuses = job.statusRulesEnabled
+        ? `, set ${count(job.unlisted)} unlisted, set ${count(job.activated)} active`
+        : "";
+      return `${opening} — scanned ${formatProductCount(job.processed)}${scopeSuffix(job)}, tagged ${count(job.tagged)}, untagged ${count(job.untagged)}${statuses}${failed}.`;
     }
 
     case SYNC_STATUS.failed:
@@ -239,9 +283,11 @@ export function bulkSyncView({ job = null, isStarting = false, startError = null
       tone: "info",
       heading: "Sync cancelled",
       notes: [
-        mutationStarted(job)
-          ? "It was stopped while tags were being updated, so some products may already have changed. Run the sync again to finish."
-          : "It was stopped before any product was changed.",
+        statusMutationStarted(job)
+          ? "It was stopped while tags or product statuses were being updated, so some products may already have changed. Run the sync again to finish."
+          : mutationStarted(job)
+            ? "It was stopped while tags were being updated, so some products may already have changed. Run the sync again to finish."
+            : "It was stopped before any product was changed.",
         ...ranFor,
       ],
     };
@@ -268,6 +314,22 @@ export function bulkSyncView({ job = null, isStarting = false, startError = null
       value: count(job.untagged),
       tone: Number(job.untagged) > 0 ? "success" : undefined,
     },
+    // Only for a run that had the status rules in force, so a tag-only run
+    // shows exactly the tiles it always did.
+    ...(job.statusRulesEnabled
+      ? [
+          {
+            label: "Set Unlisted",
+            value: count(job.unlisted),
+            tone: Number(job.unlisted) > 0 ? "critical" : undefined,
+          },
+          {
+            label: "Set Active",
+            value: count(job.activated),
+            tone: Number(job.activated) > 0 ? "success" : undefined,
+          },
+        ]
+      : []),
   ];
   if (Number(job.failed) > 0) {
     stats.push({ label: "Failed", value: count(job.failed), tone: "critical" });
@@ -284,16 +346,25 @@ export function bulkSyncView({ job = null, isStarting = false, startError = null
     );
   } else if (Number(job.processed || 0) === 0) {
     // An empty scan is almost always a scope problem, not a healthy catalog.
+    const kinds = scannedKinds(job);
     notes.push(
       job.collectionId
-        ? `No active products were found${scopeSuffix(job)}. Check that the collection contains active products.`
-        : "No active products were found in your store.",
+        ? `No ${kinds} were found${scopeSuffix(job)}. Check that the collection contains ${kinds}.`
+        : `No ${kinds} were found in your store.`,
     );
   } else if (
     // Judged on what the scan asked for, not on what landed: a run whose every
     // update failed also ends with tagged = untagged = 0.
-    Number(job.toTag || 0) + Number(job.toUntag || 0) === 0 &&
-    Number(job.tagged || 0) + Number(job.untagged || 0) === 0
+    Number(job.toTag || 0) +
+      Number(job.toUntag || 0) +
+      Number(job.toUnlist || 0) +
+      Number(job.toActivate || 0) ===
+      0 &&
+    Number(job.tagged || 0) +
+      Number(job.untagged || 0) +
+      Number(job.unlisted || 0) +
+      Number(job.activated || 0) ===
+      0
   ) {
     notes.push("All products were already up to date with your automation rules — nothing needed to change.");
   }
@@ -338,8 +409,13 @@ export function newerJob(current, incoming) {
 
 /**
  * A finished run's summary stays on screen indefinitely. Once the merchant has
- * since changed the tag or the scope, that summary describes settings no longer
- * in force, and nothing else on the page says a new run is needed.
+ * since changed the tag, the scope or the status rules, that summary describes
+ * settings no longer in force, and nothing else on the page says a new run is
+ * needed.
+ *
+ * The status rules are compared only when the caller passes
+ * `statusRulesEnabled`, and by what was in force (checkbox on and a collection
+ * selected), which is what the job pinned.
  */
 export function bulkSyncSettingsDrift(job, settings) {
   if (job?.status !== SYNC_STATUS.completed || !settings) return null;
@@ -355,6 +431,16 @@ export function bulkSyncSettingsDrift(job, settings) {
         ? `it scanned ${job.collectionTitle ? `“${job.collectionTitle}”` : "a different collection"}`
         : "it scanned the entire catalog",
     );
+  }
+  if (settings.statusRulesEnabled !== undefined) {
+    const inForce = Boolean(settings.statusRulesEnabled && settings.collectionId);
+    if (Boolean(job.statusRulesEnabled) !== inForce) {
+      changes.push(
+        job.statusRulesEnabled
+          ? "it applied the status rules"
+          : "it ran without the status rules",
+      );
+    }
   }
   if (!changes.length) return null;
 

@@ -5,6 +5,7 @@ import { unauthenticated } from "../shopify.server";
 import {
   clipCollectionTitle,
   collectionLegacyId,
+  resolveStatusAction,
   resolveTagAction,
   tagForAction,
 } from "./inventory-tags.server";
@@ -59,12 +60,16 @@ const INSTANCE_ID = `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}
  * export one product per line — the shape the whole streaming/classify/mutate
  * pipeline is built on — and it keeps Shopify, not this app, responsible for
  * resolving membership (including smart collections).
+ *
+ * `includeUnlisted` is for a run with the status rules in force, which must see
+ * the products it unlisted in order to set them back to Active once restocked.
+ * The rules are collection-based, so it never widens a whole-catalog export;
+ * every other combination sends exactly the filter the app always sent.
  */
-export function productsBulkQuery(collectionId) {
+export function productsBulkQuery(collectionId, { includeUnlisted = false } = {}) {
   const legacyId = collectionLegacyId(collectionId);
-  const filter = legacyId
-    ? `status:active AND collection_id:${legacyId}`
-    : "status:active";
+  const statuses = includeUnlisted && legacyId ? "status:active,unlisted" : "status:active";
+  const filter = legacyId ? `${statuses} AND collection_id:${legacyId}` : statuses;
 
   return `{
   products(query: ${JSON.stringify(filter)}) {
@@ -97,6 +102,15 @@ const REMOVE_TAG_MUTATION = `mutation call($id: ID!, $tags: [String!]!) {
   }
 }`;
 
+// One document for both status phases: each JSONL line carries the status.
+const STATUS_UPDATE_MUTATION = `mutation call($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
+    userErrors {
+      message
+    }
+  }
+}`;
+
 const TERMINAL_OK = "COMPLETED";
 const IN_FLIGHT = new Set(["CREATED", "RUNNING", "CANCELING"]);
 
@@ -121,12 +135,17 @@ async function claimStart(shop, tagName, scope) {
     tagName,
     collectionId: scope.collectionId,
     collectionTitle: scope.collectionTitle,
+    statusRulesEnabled: scope.statusRulesEnabled,
     status: SYNC_STATUS.querying,
     queryBulkOperationId: null,
     addMutationBulkOperationId: null,
     removeMutationBulkOperationId: null,
+    unlistMutationBulkOperationId: null,
+    activateMutationBulkOperationId: null,
     addJsonlPath: null,
     removeJsonlPath: null,
+    unlistJsonlPath: null,
+    activateJsonlPath: null,
     exported: 0,
     total: 0,
     processed: 0,
@@ -135,6 +154,10 @@ async function claimStart(shop, tagName, scope) {
     toUntag: 0,
     tagged: 0,
     untagged: 0,
+    toUnlist: 0,
+    toActivate: 0,
+    unlisted: 0,
+    activated: 0,
     failed: 0,
     errorMessage: null,
     lockedBy: null,
@@ -173,6 +196,8 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   const scope = {
     collectionId: options.collectionId ?? null,
     collectionTitle: options.collectionId ? clipCollectionTitle(options.collectionTitle) : null,
+    // What is in force, not just the checkbox: the rules are collection-based.
+    statusRulesEnabled: Boolean(options.statusRulesEnabled && options.collectionId),
   };
 
   const claimed = await claimStart(shop, tagName, scope);
@@ -183,7 +208,7 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   }
 
   try {
-    return await beginExport(admin, shop, scope.collectionId, options);
+    return await beginExport(admin, shop, scope, options);
   } catch (error) {
     // The claim is already persisted, so a failure here must release it rather
     // than leave the job stuck in `querying` with no operation to poll.
@@ -192,7 +217,7 @@ export async function startBulkSync(admin, shop, tagName, options = {}) {
   }
 }
 
-async function beginExport(admin, shop, collectionId, options) {
+async function beginExport(admin, shop, scope, options) {
   // A previous run that crashed can leave a bulk query running; Shopify allows
   // only one per app per shop, so clear it before asking for a new one.
   await cancelStaleBulkOperation(admin, "QUERY");
@@ -207,7 +232,11 @@ async function beginExport(admin, shop, collectionId, options) {
       }
     }`,
     {
-      variables: { query: productsBulkQuery(collectionId) },
+      variables: {
+        query: productsBulkQuery(scope.collectionId, {
+          includeUnlisted: scope.statusRulesEnabled,
+        }),
+      },
       label: "bulkOperationRunQuery",
     },
   );
@@ -259,6 +288,10 @@ function currentOperationId(job) {
       return job.addMutationBulkOperationId;
     case SYNC_STATUS.untagging:
       return job.removeMutationBulkOperationId;
+    case SYNC_STATUS.unlisting:
+      return job.unlistMutationBulkOperationId;
+    case SYNC_STATUS.activating:
+      return job.activateMutationBulkOperationId;
     default:
       return null;
   }
@@ -562,6 +595,8 @@ class SyncAborted extends Error {
 async function cleanupFiles(job) {
   await removeFile(job.addJsonlPath);
   await removeFile(job.removeJsonlPath);
+  await removeFile(job.unlistJsonlPath);
+  await removeFile(job.activateJsonlPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +652,7 @@ async function cancelStaleBulkOperation(admin, type) {
   }
 }
 
-async function stageJsonlUpload(admin, filePath, filename) {
+async function stageJsonlUpload(admin, filePath, filename, changes = "tag changes") {
   const data = await graphqlWithRetry(
     admin,
     `#graphql
@@ -664,14 +699,14 @@ async function stageJsonlUpload(admin, filePath, filename) {
     const body = await uploadResponse.text().catch(() => "");
     console.error(`[bulk-sync] staged upload failed: ${uploadResponse.status} ${body.slice(0, 300)}`);
     throw new Error(
-      `Could not upload the prepared tag changes to Shopify (HTTP ${uploadResponse.status}). Please run the sync again.`,
+      `Could not upload the prepared ${changes} to Shopify (HTTP ${uploadResponse.status}). Please run the sync again.`,
     );
   }
 
   return target.parameters.find((param) => param.name === "key").value;
 }
 
-async function runBulkMutation(admin, mutation, stagedUploadPath) {
+async function runBulkMutation(admin, mutation, stagedUploadPath, noun = "tag update") {
   const data = await graphqlWithRetry(
     admin,
     `#graphql
@@ -687,7 +722,7 @@ async function runBulkMutation(admin, mutation, stagedUploadPath) {
   const userErrors = data?.bulkOperationRunMutation?.userErrors || [];
   if (userErrors.length) {
     throw new FatalError(
-      `Could not start the tag update: ${userErrors.map((e) => e.message).join("; ")}`,
+      `Could not start the ${noun}: ${userErrors.map((e) => e.message).join("; ")}`,
     );
   }
 
@@ -708,6 +743,10 @@ async function runStep(admin, job) {
       return stepMutating(admin, job, "add");
     case SYNC_STATUS.untagging:
       return stepMutating(admin, job, "remove");
+    case SYNC_STATUS.unlisting:
+      return stepMutating(admin, job, "unlist");
+    case SYNC_STATUS.activating:
+      return stepMutating(admin, job, "activate");
     default:
       return { job };
   }
@@ -780,6 +819,14 @@ async function stepDownloading(admin, job) {
   const addWriter = new JsonlWriter(addPath);
   const removeWriter = new JsonlWriter(removePath);
 
+  // Status writers exist only for a run with the rules in force, so a tag-only
+  // run creates, uploads and cleans up exactly the files it always did.
+  const statusRules = Boolean(job.statusRulesEnabled);
+  const unlistPath = statusRules ? await tempJsonlPath(job.shop, "unlist") : null;
+  const activatePath = statusRules ? await tempJsonlPath(job.shop, "activate") : null;
+  const unlistWriter = statusRules ? new JsonlWriter(unlistPath) : null;
+  const activateWriter = statusRules ? new JsonlWriter(activatePath) : null;
+
   // Nothing in this loop accumulates per-product state: each line is classified
   // and written straight to disk, so peak memory is flat regardless of catalog
   // size. (A de-duplicating Set would reintroduce O(catalog) memory; it is not
@@ -803,7 +850,25 @@ async function stepDownloading(admin, job) {
         quantity: product.totalInventory,
         tracked: product.tracksInventory,
         tagName: job.tagName,
+        manageUnlisted: statusRules,
       });
+
+      if (statusRules) {
+        // The export is already filtered to the collection (the rules are never
+        // in force without one), so every line here is inside it.
+        const statusAction = resolveStatusAction({
+          status: product.status,
+          quantity: product.totalInventory,
+          tracked: product.tracksInventory,
+          enabled: true,
+          inCollection: true,
+        });
+        if (statusAction === "UNLISTED") {
+          await unlistWriter.write({ product: { id: product.id, status: "UNLISTED" } });
+        } else if (statusAction === "ACTIVE") {
+          await activateWriter.write({ product: { id: product.id, status: "ACTIVE" } });
+        }
+      }
 
       if (action === "add") {
         await addWriter.write({ id: product.id, tags: [job.tagName] });
@@ -824,6 +889,9 @@ async function stepDownloading(admin, job) {
           processed,
           toTag: addWriter.count,
           toUntag: removeWriter.count,
+          ...(statusRules
+            ? { toUnlist: unlistWriter.count, toActivate: activateWriter.count }
+            : {}),
         });
         // A cancel (or the watchdog) can land mid-stream; stop promptly instead
         // of finishing a download nobody is waiting for.
@@ -833,13 +901,19 @@ async function stepDownloading(admin, job) {
   } catch (error) {
     await addWriter.destroy();
     await removeWriter.destroy();
+    await unlistWriter?.destroy();
+    await activateWriter?.destroy();
     throw error;
   }
 
   const toTag = await addWriter.close();
   const toUntag = await removeWriter.close();
+  const toUnlist = unlistWriter ? await unlistWriter.close() : 0;
+  const toActivate = activateWriter ? await activateWriter.close() : 0;
   if (!toTag) await removeFile(addPath);
   if (!toUntag) await removeFile(removePath);
+  if (unlistPath && !toUnlist) await removeFile(unlistPath);
+  if (activatePath && !toActivate) await removeFile(activatePath);
 
   const common = {
     processed,
@@ -851,39 +925,109 @@ async function stepDownloading(admin, job) {
     lastProgressAt: new Date(),
     addJsonlPath: toTag ? addPath : null,
     removeJsonlPath: toUntag ? removePath : null,
+    ...(statusRules
+      ? {
+          toUnlist,
+          toActivate,
+          unlistJsonlPath: toUnlist ? unlistPath : null,
+          activateJsonlPath: toActivate ? activatePath : null,
+        }
+      : {}),
   };
 
-  if (!toTag && !toUntag) {
+  const next = nextMutationPhase({ ...job, ...common }, null);
+  if (!next) {
     return { job: await finish(job.shop, SYNC_STATUS.completed, common) };
   }
 
   return {
     job: await transitionFrom(job.shop, SYNC_STATUS.downloading, {
       ...common,
-      status: toTag ? SYNC_STATUS.tagging : SYNC_STATUS.untagging,
+      status: MUTATION_PHASES[next].status,
     }),
     waitMs: 0,
   };
 }
 
+const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+
+// The wording each phase uses in its errors, so the tag phases keep exactly the
+// messages they always had.
+const TAG_WORDING = {
+  noun: "tag update",
+  changes: "tag changes",
+  lost: "The prepared tag update was lost before it could be sent. Run the sync again.",
+};
+
+const STATUS_WORDING = {
+  noun: "status update",
+  changes: "status changes",
+  lost: "The prepared status update was lost before it could be sent. Run the sync again.",
+};
+
 const MUTATION_PHASES = {
   add: {
+    status: SYNC_STATUS.tagging,
     idField: "addMutationBulkOperationId",
     pathField: "addJsonlPath",
     mutation: ADD_TAG_MUTATION,
     resultField: "tagsAdd",
     filename: "add-tags.jsonl",
+    countField: "toTag",
     resultCounter: "tagged",
+    ...TAG_WORDING,
   },
   remove: {
+    status: SYNC_STATUS.untagging,
     idField: "removeMutationBulkOperationId",
     pathField: "removeJsonlPath",
     mutation: REMOVE_TAG_MUTATION,
     resultField: "tagsRemove",
     filename: "remove-tags.jsonl",
+    countField: "toUntag",
     resultCounter: "untagged",
+    ...TAG_WORDING,
+  },
+  unlist: {
+    status: SYNC_STATUS.unlisting,
+    idField: "unlistMutationBulkOperationId",
+    pathField: "unlistJsonlPath",
+    mutation: STATUS_UPDATE_MUTATION,
+    resultField: "productUpdate",
+    filename: "unlist-products.jsonl",
+    countField: "toUnlist",
+    resultCounter: "unlisted",
+    ...STATUS_WORDING,
+  },
+  activate: {
+    status: SYNC_STATUS.activating,
+    idField: "activateMutationBulkOperationId",
+    pathField: "activateJsonlPath",
+    mutation: STATUS_UPDATE_MUTATION,
+    resultField: "productUpdate",
+    filename: "activate-products.jsonl",
+    countField: "toActivate",
+    resultCounter: "activated",
+    ...STATUS_WORDING,
   },
 };
+
+/**
+ * Tags first, then statuses: a product going out of stock is tagged before it
+ * is unlisted, and a restocked one loses the tag before it goes back to Active.
+ * Shopify runs one bulk mutation at a time, so the phases are strictly serial.
+ */
+const PHASE_ORDER = ["add", "remove", "unlist", "activate"];
+
+/** The first phase after `current` (null = start) that has work, or null. */
+function nextMutationPhase(job, current) {
+  const start = current === null ? 0 : PHASE_ORDER.indexOf(current) + 1;
+  return (
+    PHASE_ORDER.slice(start).find(
+      (phase) => Number(job[MUTATION_PHASES[phase].countField] || 0) > 0,
+    ) ?? null
+  );
+}
 
 async function stepMutating(admin, job, phase) {
   const spec = MUTATION_PHASES[phase];
@@ -900,12 +1044,17 @@ async function stepMutating(admin, job, phase) {
       if (!(await fileExists(filePath))) {
         // The temp file is gone (restart on ephemeral storage, or another
         // instance). Rebuilding it means re-running the export.
-        throw new FatalError(
-          "The prepared tag update was lost before it could be sent. Run the sync again.",
-        );
+        throw new FatalError(spec.lost);
       }
-      const stagedUploadPath = await stageJsonlUpload(admin, filePath, spec.filename);
-      operationId = (await runBulkMutation(admin, spec.mutation, stagedUploadPath)).id;
+      const stagedUploadPath = await stageJsonlUpload(
+        admin,
+        filePath,
+        spec.filename,
+        spec.changes,
+      );
+      operationId = (
+        await runBulkMutation(admin, spec.mutation, stagedUploadPath, spec.noun)
+      ).id;
     }
 
     job = await transitionFrom(job.shop, job.status, {
@@ -929,7 +1078,7 @@ async function stepMutating(admin, job, phase) {
     await cleanupFiles(job);
     return {
       job: await finish(job.shop, SYNC_STATUS.failed, {
-        errorMessage: `Tag update ${op.status.toLowerCase()}${op.errorCode ? `: ${op.errorCode}` : ""}`,
+        errorMessage: `${capitalize(spec.noun)} ${op.status.toLowerCase()}${op.errorCode ? `: ${op.errorCode}` : ""}`,
       }),
     };
   }
@@ -949,11 +1098,12 @@ async function stepMutating(admin, job, phase) {
     lastProgressAt: new Date(),
   };
 
-  if (phase === "add" && job.toUntag > 0) {
+  const next = nextMutationPhase(job, phase);
+  if (next) {
     return {
-      job: await transitionFrom(job.shop, SYNC_STATUS.tagging, {
+      job: await transitionFrom(job.shop, spec.status, {
         ...data,
-        status: SYNC_STATUS.untagging,
+        status: MUTATION_PHASES[next].status,
       }),
       waitMs: 0,
     };

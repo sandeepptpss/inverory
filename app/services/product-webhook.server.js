@@ -1,7 +1,10 @@
 import {
+  applyStatusAction,
   applyTagAction,
   getSettings,
+  resolveStatusAction,
   resolveTagAction,
+  statusRulesActive,
   tagForAction,
   withProductLock,
 } from "./inventory-tags.server";
@@ -47,11 +50,12 @@ function toProductGid(id) {
 
 /**
  * Shared body of the products/create and products/update handlers: re-read the
- * product and bring its tag in line with the rules.
+ * product and bring its tag (and, with the status rules on, its status) in line
+ * with the rules.
  *
- * products/update also fires for our own tagsAdd/tagsRemove. That settles
- * rather than loops: once the tag matches the rules the next pass resolves to
- * no action, so the echo costs one read and stops.
+ * products/update also fires for our own tagsAdd/tagsRemove/productUpdate. That
+ * settles rather than loops: once the product matches the rules the next pass
+ * resolves to no action, so the echo costs one read and stops.
  */
 export async function syncProductTagFromWebhook({ shop, admin, payload, label }) {
   const productId = payload?.id;
@@ -60,14 +64,21 @@ export async function syncProductTagFromWebhook({ shop, admin, payload, label })
   // Draft and archived products are never modified, so a status we can read
   // straight from the payload saves the Admin API call entirely — worth having
   // on products/update, which fires on every product edit in the store.
-  const payloadStatus = payload?.status;
-  if (payloadStatus && String(payloadStatus).toUpperCase() !== "ACTIVE") {
+  const payloadStatus = payload?.status ? String(payload.status).toUpperCase() : null;
+  if (payloadStatus && payloadStatus !== "ACTIVE" && payloadStatus !== "UNLISTED") {
     return new Response();
   }
 
   const settings = await getSettings(shop);
   if (!settings.autoSyncEnabled) {
     console.log(`Auto Sync is disabled for ${shop}; skipping ${label}.`);
+    return new Response();
+  }
+
+  // An unlisted product is only this app's business while the status rules are
+  // in force; otherwise it is skipped exactly as it always was.
+  const statusRules = statusRulesActive(settings);
+  if (payloadStatus === "UNLISTED" && !statusRules) {
     return new Response();
   }
 
@@ -104,23 +115,44 @@ export async function syncProductTagFromWebhook({ shop, admin, payload, label })
         tagName,
         collectionScoped: Boolean(collectionId),
         inCollection: product.inCollection,
+        manageUnlisted: statusRules,
       });
 
-      if (!tagAction) return;
+      if (tagAction) {
+        const userErrors = await applyTagAction(
+          admin,
+          product.id,
+          tagForAction(product.tags, tagName, tagAction),
+          tagAction,
+          { attempts: WEBHOOK_ATTEMPTS },
+        );
+        if (userErrors.length) {
+          // userErrors are a rejection of the request itself (bad tag, missing
+          // product); redelivering would fail identically, so log and accept.
+          console.error(
+            `${tagAction === "add" ? "tagsAdd" : "tagsRemove"} failed for ${product.id}:`,
+            userErrors,
+          );
+        }
+      }
 
-      const userErrors = await applyTagAction(
-        admin,
-        product.id,
-        tagForAction(product.tags, tagName, tagAction),
-        tagAction,
-        { attempts: WEBHOOK_ATTEMPTS },
-      );
-      if (userErrors.length) {
-        // userErrors are a rejection of the request itself (bad tag, missing
-        // product); redelivering would fail identically, so log and accept.
+      const statusAction = resolveStatusAction({
+        status: product.status,
+        quantity: product.totalInventory,
+        tracked: product.tracksInventory,
+        enabled: statusRules,
+        inCollection: product.inCollection,
+      });
+
+      if (!statusAction) return;
+
+      const statusErrors = await applyStatusAction(admin, product.id, statusAction, {
+        attempts: WEBHOOK_ATTEMPTS,
+      });
+      if (statusErrors.length) {
         console.error(
-          `${tagAction === "add" ? "tagsAdd" : "tagsRemove"} failed for ${product.id}:`,
-          userErrors,
+          `productUpdate (status ${statusAction}) failed for ${product.id}:`,
+          statusErrors,
         );
       }
     });

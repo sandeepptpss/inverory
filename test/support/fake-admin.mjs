@@ -32,6 +32,10 @@ export class FakeAdmin {
     return this.products.get(id)?.tags ?? null;
   }
 
+  statusOf(id) {
+    return this.products.get(id)?.status ?? null;
+  }
+
   countCalls(name) {
     return this.calls.filter((call) => call === name).length;
   }
@@ -109,6 +113,16 @@ export class FakeAdmin {
         }
         product.tags = product.tags.filter((existing) => !variables.tags.includes(existing));
         return json({ data: { tagsRemove: { userErrors: [] } } });
+      }
+
+      case "setProductStatus": {
+        const { id, status } = variables.product ?? {};
+        const product = this.products.get(id);
+        if (!product) {
+          return json({ data: { productUpdate: { userErrors: [{ message: "Product not found" }] } } });
+        }
+        product.status = status;
+        return json({ data: { productUpdate: { userErrors: [] } } });
       }
 
       default:

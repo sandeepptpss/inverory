@@ -1,8 +1,11 @@
 import { authenticate } from "../shopify.server";
 import {
+  applyStatusAction,
   applyTagAction,
   getSettings,
+  resolveStatusAction,
   resolveTagAction,
+  statusRulesActive,
   tagForAction,
   withProductLock,
 } from "../services/inventory-tags.server";
@@ -74,6 +77,9 @@ export const action = async ({ request }) => {
 
   const inventoryItemGid = `gid://shopify/InventoryItem/${inventoryItemId}`;
   const collectionId = settings.collectionId ?? null;
+  // Only ever true with a collection selected, so the lookup below is always
+  // the scoped one that carries `inCollection`.
+  const statusRules = statusRulesActive(settings);
   const lookupQuery = collectionId
     ? PRODUCT_FOR_INVENTORY_ITEM_IN_COLLECTION
     : PRODUCT_FOR_INVENTORY_ITEM;
@@ -121,27 +127,50 @@ export const action = async ({ request }) => {
         tagName,
         collectionScoped: Boolean(collectionId),
         inCollection: product.inCollection,
+        manageUnlisted: statusRules,
       });
 
-      if (!tagAction) return;
+      if (tagAction) {
+        const userErrors = await applyTagAction(
+          admin,
+          product.id,
+          // A removal targets the casing stored on the product, not the
+          // configured one, so it lands whether or not Shopify matches tag case.
+          tagForAction(product.tags, tagName, tagAction),
+          tagAction,
+          {
+            attempts: WEBHOOK_ATTEMPTS,
+          },
+        );
+        if (userErrors.length) {
+          // userErrors are a rejection of the request itself (bad tag, missing
+          // product); redelivering would fail identically, so log and accept.
+          console.error(
+            `${tagAction === "add" ? "tagsAdd" : "tagsRemove"} failed for ${product.id}:`,
+            userErrors,
+          );
+        }
+      }
 
-      const userErrors = await applyTagAction(
-        admin,
-        product.id,
-        // A removal targets the casing stored on the product, not the
-        // configured one, so it lands whether or not Shopify matches tag case.
-        tagForAction(product.tags, tagName, tagAction),
-        tagAction,
-        {
-          attempts: WEBHOOK_ATTEMPTS,
-        },
-      );
-      if (userErrors.length) {
-        // userErrors are a rejection of the request itself (bad tag, missing
-        // product); redelivering would fail identically, so log and accept.
+      // Decided on the same snapshot as the tag; the tag write does not change
+      // status, stock or collection membership.
+      const statusAction = resolveStatusAction({
+        status: product.status,
+        quantity: product.totalInventory,
+        tracked: product.tracksInventory,
+        enabled: statusRules,
+        inCollection: product.inCollection,
+      });
+
+      if (!statusAction) return;
+
+      const statusErrors = await applyStatusAction(admin, product.id, statusAction, {
+        attempts: WEBHOOK_ATTEMPTS,
+      });
+      if (statusErrors.length) {
         console.error(
-          `${tagAction === "add" ? "tagsAdd" : "tagsRemove"} failed for ${product.id}:`,
-          userErrors,
+          `productUpdate (status ${statusAction}) failed for ${product.id}:`,
+          statusErrors,
         );
       }
     });

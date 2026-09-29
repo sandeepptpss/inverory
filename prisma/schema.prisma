@@ -47,23 +47,36 @@ model TagAutomationSetting {
   // Cached for display only — the merchant can rename a collection in Shopify
   // and the picker falls back to this label until the list is reloaded.
   collectionTitle String? @db.VarChar(255)
+
+  // Opt-in status rules: out of stock -> UNLISTED, restocked -> ACTIVE. Only in
+  // force while a collection is selected; with the whole catalog in scope they
+  // do nothing, so a stray click can never unlist an entire store.
+  statusRulesEnabled Boolean @default(false)
 }
 
 model BulkSyncJob {
-  shop                          String  @id
-  tagName                       String  @db.VarChar(255)
+  shop                            String  @id
+  tagName                         String  @db.VarChar(255)
   // The scope this run was started with, copied from the settings at claim time
   // so that changing the selection mid-run cannot move the goalposts of a job
   // that is already exporting. NULL means the whole catalog.
-  collectionId                  String?
-  collectionTitle               String? @db.VarChar(255)
-  // querying | downloading | tagging | untagging | completed | failed | cancelled
-  status                        String
-  queryBulkOperationId          String?
-  addMutationBulkOperationId    String?
-  removeMutationBulkOperationId String?
-  addJsonlPath                  String? @db.Text
-  removeJsonlPath               String? @db.Text
+  collectionId                    String?
+  collectionTitle                 String? @db.VarChar(255)
+  // Whether the status rules were in force when this run was claimed (already
+  // false for a run with no collection), pinned for the same reason as the scope.
+  statusRulesEnabled              Boolean @default(false)
+  // querying | downloading | tagging | untagging | unlisting | activating
+  // | completed | failed | cancelled
+  status                          String
+  queryBulkOperationId            String?
+  addMutationBulkOperationId      String?
+  removeMutationBulkOperationId   String?
+  unlistMutationBulkOperationId   String?
+  activateMutationBulkOperationId String?
+  addJsonlPath                    String? @db.Text
+  removeJsonlPath                 String? @db.Text
+  unlistJsonlPath                 String? @db.Text
+  activateJsonlPath               String? @db.Text
 
   // Progress counters. `total` is only known once the export finishes, because
   // Shopify does not report a catalog size up front.
@@ -75,6 +88,10 @@ model BulkSyncJob {
   toUntag           Int @default(0)
   tagged            Int @default(0)
   untagged          Int @default(0)
+  toUnlist          Int @default(0)
+  toActivate        Int @default(0)
+  unlisted          Int @default(0)
+  activated         Int @default(0)
   failed            Int @default(0)
 
   errorMessage String? @db.Text
